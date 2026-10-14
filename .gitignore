@@ -1,0 +1,10 @@
+build/
+dist/
+tcl-runtime/
+__pycache__/
+*.spec
+config.json
+self-test.txt
+.env*
+release/
+*.zip
