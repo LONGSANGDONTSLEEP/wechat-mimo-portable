@@ -12,11 +12,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import urllib.request
 import urllib.error
+import vision
 
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 DEFAULT = dict(base_url='https://api.xiaomimimo.com/v1', model='mimo-v2.6-pro',
                prompt='你是微信聊天助手。自然、简短地用中文回复对方，不编造事实。只输出要发送的正文。',
-               title='', auto=False, interval=3, regions={})
+               title='', auto=False, interval=3)
 
 def fingerprint(text):
     return hashlib.sha256(''.join(text.split()).encode()).hexdigest()
@@ -43,17 +44,10 @@ async def recognize_image(image):
     import winocr
     return await winocr.recognize_pil(image, lang='zh-Hans')
 
-def ocr(region):
-    import pyautogui
-    import winocr
-    shot = pyautogui.screenshot(region=tuple(region))
-    result = asyncio.run(recognize_image(shot))
-    return result.text.strip()
-
 class App:
     def __init__(self, root):
         self.root=root
-        root.title('微信 MiMo 助手 · 便携版 0.1.0')
+        root.title('微信 MiMo 助手 · 全窗口 OCR 0.2.0')
         root.geometry('800x780')
         self.cfg=DEFAULT.copy()
         if (ROOT/'config.json').exists():
@@ -63,8 +57,8 @@ class App:
         self.history=[]; self.pending=None; self.seen=set(); self.vars={}; self.awaiting=threading.Event()
         frame=ttk.Frame(root,padding=16); frame.pack(fill='both',expand=True)
         ttk.Label(frame,text='微信窗口截图识别 + MiMo 回复',font=('Microsoft YaHei UI',16,'bold')).pack(anchor='w')
-        ttk.Label(frame,text='固定一个聊天；微信保持可见。先校准，再用预览模式检查识别。').pack(anchor='w',pady=8)
-        for name,label in [('base_url','接口地址'),('model','模型'),('title','目标聊天标题（必须填写）')]:
+        ttk.Label(frame,text='自动找到微信，识别未读聊天并生成回复；无需框选或校准。').pack(anchor='w',pady=8)
+        for name,label in [('base_url','接口地址'),('model','模型'),('title','仅回复此聊天（可留空）')]:
             row=ttk.Frame(frame); row.pack(fill='x',pady=3)
             ttk.Label(row,text=label,width=26).pack(side='left')
             self.vars[name]=tk.StringVar(value=self.cfg[name]); ttk.Entry(row,textvariable=self.vars[name]).pack(side='left',fill='x',expand=True)
@@ -76,9 +70,6 @@ class App:
             ttk.Button(row,text=label,command=lambda u=url:self.vars['base_url'].set(u)).pack(side='left',padx=3)
         ttk.Label(frame,text='回复提示词').pack(anchor='w')
         self.prompt=tk.Text(frame,height=3,wrap='word'); self.prompt.insert('1.0',self.cfg['prompt']); self.prompt.pack(fill='x')
-        row=ttk.Frame(frame); row.pack(fill='x',pady=8)
-        for name,label in [('message','① 对方消息区域'),('header','② 聊天标题区域'),('input','③ 输入框位置')]:
-            ttk.Button(row,text=label,command=lambda n=name:self.calibrate(n)).pack(side='left',padx=3)
         self.auto=tk.BooleanVar(value=False)
         ttk.Checkbutton(frame,text='开启自动发送（默认只生成预览）',variable=self.auto).pack(anchor='w')
         row=ttk.Frame(frame); row.pack(fill='x',pady=8)
@@ -105,34 +96,11 @@ class App:
         (ROOT/'config.json').write_text(json.dumps(self.cfg,ensure_ascii=False,indent=2),'utf-8')
         self.status.set('已保存配置；API Key 不保存')
 
-    def calibrate(self,name):
-        if self.running: return messagebox.showinfo('校准','请先停止监听')
-        self.root.withdraw()
-        overlay=tk.Toplevel(self.root); overlay.attributes('-fullscreen',True); overlay.attributes('-topmost',True); overlay.attributes('-alpha',0.35)
-        canvas=tk.Canvas(overlay,bg='black',cursor='cross'); canvas.pack(fill='both',expand=True)
-        canvas.create_text(40,40,anchor='nw',fill='white',font=('Microsoft YaHei UI',18),text='点击输入框' if name=='input' else '拖动框选区域；消息区域只包含对方消息，勿包含自己的回复。Esc 取消')
-        origin=[]; rectangle=[]
-        def finish(event):
-            if name=='input': self.cfg['regions'][name]=[event.x_root,event.y_root]
-            else:
-                x,y=origin; w=abs(event.x_root-x); h=abs(event.y_root-y)
-                if w<10 or h<10: return
-                self.cfg['regions'][name]=[min(x,event.x_root),min(y,event.y_root),w,h]
-            overlay.destroy(); self.root.deiconify(); self.status.set('校准完成：'+name)
-        def down(e):
-            origin[:]=[e.x_root,e.y_root]; rectangle[:]=[canvas.create_rectangle(e.x,e.y,e.x,e.y,outline='red',width=3)]
-        def motion(e):
-            if rectangle: canvas.coords(rectangle[0],origin[0],origin[1],e.x,e.y)
-        if name=='input': canvas.bind('<Button-1>',finish)
-        else:
-            canvas.bind('<Button-1>',down); canvas.bind('<B1-Motion>',motion); canvas.bind('<ButtonRelease-1>',finish)
-        overlay.bind('<Escape>',lambda e:(overlay.destroy(),self.root.deiconify()))
-
     def start(self):
         if self.running:return
         cfg=self.snapshot(); key=self.key.get().strip()
-        if not key or not cfg['title'] or any(n not in cfg['regions'] for n in ('message','header','input')):
-            return messagebox.showerror('尚未配置','请填写 Key、聊天标题，并完成三项校准')
+        if not key:
+            return messagebox.showerror('尚未配置','请填写 MiMo API Key')
         self.stop.clear(); self.awaiting.clear(); self.running=True; self.pending=None; self.seen=set(); self.history=[]
         self.start_button.configure(state='disabled'); self.status.set('监听中（Esc 全局停止；鼠标移到屏幕左上角也会停止）')
         threading.Thread(target=self.worker,args=(cfg,key),daemon=True).start()
@@ -141,59 +109,88 @@ class App:
         if ctypes.windll.user32.GetAsyncKeyState(0x1B)&0x8000:self.stop.set()
         return self.stop.is_set()
 
-    def check_title(self,cfg):
-        actual=ocr(cfg['regions']['header'])
-        if ''.join(actual.split())!=''.join(cfg['title'].split()):
-            raise ValueError('聊天标题不匹配，请恢复目标聊天并核对标题区域')
+    def inspect(self,hwnd):
+        import pyautogui
+        if not vision.foreground(hwnd):
+            vision.activate(hwnd); time.sleep(.4)
+        if not vision.foreground(hwnd):raise ValueError('微信未处于前台，请点击微信后重新开始')
+        rect=vision.window_rect(hwnd)
+        image=pyautogui.screenshot(region=rect)
+        result=asyncio.run(recognize_image(image))
+        return vision.parse(image,vision.flatten(result),hwnd,rect)
 
     def worker(self,cfg,key):
         try:
-            self.check_title(cfg)
-            baseline=ocr(cfg['regions']['message']); self.seen.add(fingerprint(baseline))
-            self.events.put(('log','已忽略启动时已有消息，等待新消息。'))
+            import pyautogui
+            hwnd=vision.find_wechat(); vision.activate(hwnd); time.sleep(.5)
+            view=self.inspect(hwnd)
+            self.seen.add(fingerprint(view.title+'\n'+view.message))
+            self.events.put(('log','已自动找到微信：'+view.title+'；当前旧消息已忽略。'))
             candidate=''; count=0
+            visited={}; histories={}
             while not self.halted():
                 if self.stop.wait(cfg['interval']):break
                 if self.awaiting.is_set():continue
-                self.check_title(cfg); text=ocr(cfg['regions']['message'])
+                view=self.inspect(hwnd)
+                # Only switch between chats before generating a reply, never during preview/send.
+                if view.unread and count==0:
+                    target=next((p for p in view.unread if time.monotonic()-visited.get(p,0)>30),None)
+                    if target:
+                        visited[target]=time.monotonic(); pyautogui.click(*target); time.sleep(.7)
+                        view=self.inspect(hwnd)
+                if cfg['title'] and fingerprint(cfg['title'])!=fingerprint(view.title):
+                    count=0; continue
+                text=view.message
                 if not text:continue
-                count=count+1 if fingerprint(text)==fingerprint(candidate) else 1; candidate=text
-                token=fingerprint(text)
-                if count<2 or token in self.seen:continue
+                token=fingerprint(view.title+'\n'+text)
+                count=count+1 if token==candidate else 1; candidate=token
+                if token in self.seen:count=0; continue
+                if count<2:continue
                 self.seen.add(token)
-                self.events.put(('log','识别：'+text))
+                self.events.put(('log','['+view.title+'] 识别：'+text))
+                self.history=histories.setdefault(view.title,[])
                 answer=completion(cfg,key,text,self.history)
                 if self.halted():break
                 if not cfg['auto']:self.awaiting.set()
-                self.events.put(('preview',(cfg,text,answer)))
-                if cfg['auto']:self.deliver(cfg,text,answer)
+                self.events.put(('preview',(view,text,answer)))
+                if cfg['auto']:self.deliver(view,text,answer)
+                histories[view.title]=self.history
+                count=0
         except Exception as exc:self.events.put(('log','已停止：'+str(exc)))
         finally:self.stop.set(); self.events.put(('done',None))
 
-    def deliver(self,cfg,text,answer):
+    def deliver(self,expected,text,answer):
         import pyautogui
         import pyperclip
         if self.halted():return
-        self.check_title(cfg)
-        if fingerprint(ocr(cfg['regions']['message']))!=fingerprint(text):
-            raise ValueError('消息已变化，取消发送本次回复')
-        pyautogui.click(*cfg['regions']['input']); time.sleep(0.25)
-        self.check_title(cfg)
+        current=self.inspect(expected.hwnd)
+        if fingerprint(current.title)!=fingerprint(expected.title) or fingerprint(current.message)!=fingerprint(text):
+            raise ValueError('聊天或消息已变化，取消发送')
+        pyautogui.click(*current.input_point); time.sleep(0.25)
+        # Refuse to append to a user draft. Clipboard is restored after the check.
+        previous=pyperclip.paste(); pyperclip.copy('')
+        pyautogui.hotkey('ctrl','a'); pyautogui.hotkey('ctrl','c'); time.sleep(.2)
+        draft=pyperclip.paste(); pyperclip.copy(previous)
+        pyautogui.press('right')
+        if draft.strip():raise ValueError('输入框存在草稿，已停止，请清空后重试')
         if self.halted():return
         pyperclip.copy(answer); pyautogui.hotkey('ctrl','v'); time.sleep(0.35)
         if self.halted():return
-        self.check_title(cfg); pyautogui.press('enter')
+        current=self.inspect(expected.hwnd)
+        if fingerprint(current.title)!=fingerprint(expected.title):raise ValueError('聊天已变化，取消发送')
+        if self.halted():return
+        pyautogui.press('enter')
         self.history.extend([{'role':'user','content':text},{'role':'assistant','content':answer}]); self.history=self.history[-12:]
         self.awaiting.clear(); self.events.put(('sent',None))
 
     def send_pending(self):
         if not self.pending:return
-        cfg,text,answer=self.pending
-        if self.running and cfg['auto']:return
+        view,text,answer=self.pending
+        if self.auto.get():return
         if self.stop.is_set():return messagebox.showinfo('发送','监听已停止，请重新启动后生成预览')
         self.pending=None
         def send():
-            try:self.deliver(cfg,text,answer)
+            try:self.deliver(view,text,answer)
             except Exception as exc:self.events.put(('log','发送失败：'+str(exc))); self.stop.set()
         threading.Thread(target=send,daemon=True).start()
 
@@ -218,7 +215,7 @@ if __name__=='__main__':
         assert fingerprint('你好\n 世界')==fingerprint('你好 世界')
         import pyautogui, pyperclip, winocr
         from PIL import Image, ImageDraw, ImageFont
-        window=tk.Tk(); window.withdraw(); window.update(); window.destroy()
+        window=tk.Tk(); instance=App(window); window.withdraw(); window.update(); window.destroy()
         sample=Image.new('RGB',(600,100),'white')
         ImageDraw.Draw(sample).text((10,10),'你好 微信 测试',font=ImageFont.truetype('msyh.ttc',32),fill='black')
         result=asyncio.run(recognize_image(sample))
