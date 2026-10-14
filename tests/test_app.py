@@ -41,4 +41,33 @@ class Tests(unittest.TestCase):
         self.assertEqual(app.fingerprint('你 好\n'),app.fingerprint('你好'))
         self.assertNotEqual(app.fingerprint('你好'),app.fingerprint('您好'))
 
+    def test_locked_point_tracks_move_but_rejects_resize(self):
+        saved={'size':[1000,700],'point':[450,580]}
+        self.assertEqual(vision.confirmed_point((100,200,1000,700),saved),(550,780))
+        self.assertEqual(vision.confirmed_point((-100,50,1000,700),saved),(350,630))
+        with self.assertRaises(ValueError):vision.confirmed_point((0,0,900,700),saved)
+        with self.assertRaises(ValueError):vision.confirmed_point((0,0,1000,700),None)
+
+    def test_wrong_chat_prevents_any_click(self):
+        import threading
+        instance=app.App.__new__(app.App)
+        instance.monitor={'pid':1,'input':{'size':[1000,700],'point':[500,600]}}
+        instance.halted=lambda:False
+        before=vision.View(10,(0,0,1000,700),'目标','消息',(500,600),[])
+        changed=vision.View(10,(0,0,1000,700),'其他人','消息',(500,600),[])
+        instance.inspect=lambda _:changed
+        with patch('vision.validate_window'),patch('vision.activate'),patch('vision.foreground',return_value=True),patch('pyautogui.click') as click,patch('app.time.sleep'):
+            with self.assertRaises(ValueError):instance.deliver(before,'消息','回复')
+            click.assert_not_called()
+
+    def test_obscured_point_prevents_any_click(self):
+        instance=app.App.__new__(app.App)
+        instance.monitor={'pid':1,'input':{'size':[1000,700],'point':[500,600]}}
+        instance.halted=lambda:False
+        view=vision.View(10,(0,0,1000,700),'目标','消息',(500,600),[])
+        instance.inspect=lambda _:view
+        with patch('vision.validate_window'),patch('vision.activate'),patch('vision.foreground',return_value=True),patch('vision.ensure_point',side_effect=ValueError('遮挡')),patch('pyautogui.click') as click,patch('app.time.sleep'):
+            with self.assertRaises(ValueError):instance.deliver(view,'消息','回复')
+            click.assert_not_called()
+
 if __name__=='__main__':unittest.main()
