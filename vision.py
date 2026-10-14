@@ -4,6 +4,110 @@ from ctypes import wintypes
 from dataclasses import dataclass
 import re
 
+def enable_dpi_awareness():
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except (AttributeError,OSError):
+        ctypes.windll.user32.SetProcessDPIAware()
+
+def list_windows():
+    user=ctypes.windll.user32; kernel=ctypes.windll.kernel32
+    user.GetWindowTextW.argtypes=[wintypes.HWND,wintypes.LPWSTR,ctypes.c_int]
+    user.GetClassNameW.argtypes=[wintypes.HWND,wintypes.LPWSTR,ctypes.c_int]
+    user.GetWindowThreadProcessId.argtypes=[wintypes.HWND,ctypes.POINTER(wintypes.DWORD)]
+    user.IsWindowVisible.argtypes=[wintypes.HWND]
+    kernel.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
+    kernel.OpenProcess.restype=wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes=[wintypes.HANDLE,wintypes.DWORD,wintypes.LPWSTR,ctypes.POINTER(wintypes.DWORD)]
+    kernel.CloseHandle.argtypes=[wintypes.HANDLE]
+    windows=[]
+    callback=ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HWND,wintypes.LPARAM)
+    def visit(hwnd,_):
+        if not user.IsWindowVisible(hwnd):return True
+        name=ctypes.create_unicode_buffer(512); kind=ctypes.create_unicode_buffer(512)
+        user.GetWindowTextW(hwnd,name,512); user.GetClassNameW(hwnd,kind,512)
+        pid=wintypes.DWORD(); user.GetWindowThreadProcessId(hwnd,ctypes.byref(pid))
+        handle=kernel.OpenProcess(0x1000,False,pid.value)
+        executable=''
+        if handle:
+            try:
+                path=ctypes.create_unicode_buffer(4096); size=wintypes.DWORD(4096)
+                if kernel.QueryFullProcessImageNameW(handle,0,path,ctypes.byref(size)):
+                    executable=path.value.rsplit('\\',1)[-1].lower()
+            finally:kernel.CloseHandle(handle)
+        if executable in ('wechat.exe','weixin.exe') or kind.value=='WeChatMainWndForPC':
+            if name.value:windows.append((hwnd,pid.value,name.value,kind.value))
+        return True
+    user.EnumWindows(callback(visit),0)
+    return windows
+
+def validate_window(hwnd,pid):
+    user=ctypes.windll.user32
+    user.IsWindow.argtypes=[wintypes.HWND]
+    user.GetWindowThreadProcessId.argtypes=[wintypes.HWND,ctypes.POINTER(wintypes.DWORD)]
+    actual=wintypes.DWORD(); user.GetWindowThreadProcessId(hwnd,ctypes.byref(actual))
+    if not user.IsWindow(hwnd) or actual.value!=pid:raise ValueError('锁定的窗口已关闭，请重新选择窗口')
+
+def ensure_point(hwnd,point):
+    user=ctypes.windll.user32
+    user.WindowFromPoint.argtypes=[wintypes.POINT]; user.WindowFromPoint.restype=wintypes.HWND
+    user.GetAncestor.argtypes=[wintypes.HWND,wintypes.UINT]; user.GetAncestor.restype=wintypes.HWND
+    target=user.WindowFromPoint(wintypes.POINT(int(point[0]),int(point[1])))
+    if user.GetAncestor(target,2)!=hwnd:raise ValueError('发送位置被其他窗口遮挡，已取消操作')
+
+def client_rect(hwnd):
+    user=ctypes.windll.user32
+    user.GetClientRect.argtypes=[wintypes.HWND,ctypes.POINTER(wintypes.RECT)]
+    user.ClientToScreen.argtypes=[wintypes.HWND,ctypes.POINTER(wintypes.POINT)]
+    bounds=wintypes.RECT(); point=wintypes.POINT(0,0)
+    if not user.GetClientRect(hwnd,ctypes.byref(bounds)) or not user.ClientToScreen(hwnd,ctypes.byref(point)):
+        raise ValueError('无法获取指定窗口')
+    w,h=bounds.right,bounds.bottom
+    if w<400 or h<350:raise ValueError('指定窗口太小，请扩大窗口')
+    return point.x,point.y,w,h
+
+def capture_window(hwnd,pid):
+    """PrintWindow captures only the locked client, not overlapping desktop pixels."""
+    from PIL import Image
+    validate_window(hwnd,pid)
+    user=ctypes.windll.user32; gdi=ctypes.windll.gdi32
+    user.GetDC.argtypes=[wintypes.HWND]; user.GetDC.restype=wintypes.HDC
+    user.ReleaseDC.argtypes=[wintypes.HWND,wintypes.HDC]
+    user.PrintWindow.argtypes=[wintypes.HWND,wintypes.HDC,wintypes.UINT]
+    gdi.CreateCompatibleDC.argtypes=[wintypes.HDC]; gdi.CreateCompatibleDC.restype=wintypes.HDC
+    gdi.CreateCompatibleBitmap.argtypes=[wintypes.HDC,ctypes.c_int,ctypes.c_int]; gdi.CreateCompatibleBitmap.restype=wintypes.HBITMAP
+    gdi.SelectObject.argtypes=[wintypes.HDC,wintypes.HANDLE]; gdi.SelectObject.restype=wintypes.HANDLE
+    gdi.GetDIBits.argtypes=[wintypes.HDC,wintypes.HBITMAP,wintypes.UINT,wintypes.UINT,ctypes.c_void_p,ctypes.c_void_p,wintypes.UINT]
+    gdi.DeleteObject.argtypes=[wintypes.HANDLE]; gdi.DeleteDC.argtypes=[wintypes.HDC]
+    rect=client_rect(hwnd); x,y,w,h=rect
+    dc=user.GetDC(hwnd); memory=gdi.CreateCompatibleDC(dc); bitmap=gdi.CreateCompatibleBitmap(dc,w,h)
+    old=gdi.SelectObject(memory,bitmap)
+    class Header(ctypes.Structure):
+        _fields_=[('size',wintypes.DWORD),('width',wintypes.LONG),('height',wintypes.LONG),('planes',wintypes.WORD),('bits',wintypes.WORD),('compression',wintypes.DWORD),('image_size',wintypes.DWORD),('xppm',wintypes.LONG),('yppm',wintypes.LONG),('used',wintypes.DWORD),('important',wintypes.DWORD)]
+    try:
+        ok=user.PrintWindow(hwnd,memory,3)
+        gdi.SelectObject(memory,old)
+        info=Header(40,w,-h,1,32,0,0,0,0,0,0); data=ctypes.create_string_buffer(w*h*4)
+        rows=gdi.GetDIBits(memory,bitmap,0,h,data,ctypes.byref(info),0) if ok else 0
+        if rows==h:
+            image=Image.frombytes('RGB',(w,h),data.raw,'raw','BGRX')
+            from PIL import ImageStat
+            if max(ImageStat.Stat(image).stddev)>3:return image,rect
+    finally:
+        gdi.SelectObject(memory,old); gdi.DeleteObject(bitmap); gdi.DeleteDC(memory); user.ReleaseDC(hwnd,dc)
+    # GPU-rendered windows may not implement PrintWindow. Never capture an obscuring app.
+    if not foreground(hwnd):raise ValueError('此窗口不支持后台截图，请将所选微信窗口置于前台')
+    for point in ((x+10,y+10),(x+w-10,y+10),(x+10,y+h-10),(x+w-10,y+h-10),(x+w//2,y+h//2)):
+        ensure_point(hwnd,point)
+    import pyautogui
+    return pyautogui.screenshot(region=rect),rect
+
+def confirmed_point(rect,saved):
+    if not saved or list(rect[2:])!=saved['size']:raise ValueError('请在窗口预览中设置输入框位置；窗口缩放后需重新确认')
+    x,y,w,h=rect; px,py=saved['point']
+    if not 0<px<w or not 0<py<h:raise ValueError('发送位置超出所选窗口')
+    return x+px,y+py
+
 @dataclass(frozen=True)
 class Text:
     text: str
@@ -120,8 +224,10 @@ def unread_badges(image,split):
         if all(abs(row-old)>25 for old in rows):rows.append(row)
     return sorted(rows)
 
-def parse(image,lines,hwnd,rect):
-    split=divider(image); top=input_top(image,split); w,h=image.size
+def parse(image,lines,hwnd,rect,split_override=None,input_override=None):
+    split=divider(image) if split_override is None else split_override
+    top=input_top(image,split) if input_override is None else input_override
+    w,h=image.size
     titles=[t for t in lines if t.x>split+12 and t.y<95 and t.y>12 and t.text.replace(' ','') not in ('微信','WeChat','Weixin','搜索')]
     if not titles:raise ValueError('未识别到聊天标题，请打开一个聊天')
     title=min(titles,key=lambda t:(t.y,t.x)).text
