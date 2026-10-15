@@ -11,3 +11,7 @@ release/
 private-tests/
 regression-report.json
 ocr-check.json
+data/
+vendor/
+studio-self-test.png
+ui-self-test-*.png
