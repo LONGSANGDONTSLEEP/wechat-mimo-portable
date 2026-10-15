@@ -12,6 +12,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import urllib.request
 import urllib.error
+import urllib.parse
 import vision
 import recognition
 from types import SimpleNamespace
@@ -21,23 +22,45 @@ _ocr_lock=threading.Lock()
 
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 DEFAULT = dict(base_url='https://api.xiaomimimo.com/v1', model='mimo-v2.6-pro',
-               prompt='你是微信聊天助手。自然、简短地用中文回复对方，不编造事实。只输出要发送的正文。',
+               prompt='自然接住对方的话题，不编造经历或承诺。只输出要发送的正文。',
                title='', auto=False, interval=3)
 
 def fingerprint(text):
     return hashlib.sha256(''.join(text.split()).encode()).hexdigest()
 
+def normalize_api_key(value):
+    key=value.strip().lstrip('\ufeff')
+    if key.lower().startswith('bearer '):key=key[7:].strip()
+    if len(key)>1 and key[0]==key[-1] and key[0] in ('"',"'"):key=key[1:-1].strip()
+    if not key:raise ValueError('请填写小米控制台复制的 API Key')
+    if not key.isascii():raise ValueError('API Key 含中文、全角或不可见字符，无法放入请求头。请清空后从小米控制台重新复制纯 Key，不要复制说明文字。')
+    if any(ord(c)<33 or ord(c)>126 for c in key):raise ValueError('API Key 内含空格、换行或控制字符，请重新复制完整 Key')
+    return key
+
+def validate_connection(cfg,key):
+    key=normalize_api_key(key)
+    base=cfg['base_url'].strip().rstrip('/')
+    parsed=urllib.parse.urlsplit(base)
+    if not base.isascii() or parsed.scheme!='https' or not parsed.hostname:
+        raise ValueError('接口地址应为英文 HTTPS 地址，请点击按量付费或 Token Plan 按钮恢复')
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError('接口地址只能填写 Base URL，不能包含账号、密钥或查询参数')
+    if not cfg['model'].strip() or not cfg['model'].isascii():raise ValueError('模型名称应为英文模型 ID，例如 mimo-v2.6-pro')
+    return key,base+'/chat/completions'
+
 def completion(cfg, key, text, history):
+    key,url=validate_connection(cfg,key)
     payload = dict(model=cfg['model'], messages=[{'role':'system','content':cfg['prompt']}]+history[-12:]+[{'role':'user','content':text}], max_completion_tokens=2048, stream=False)
-    url = cfg['base_url'].rstrip('/')+'/chat/completions'
-    if not url.startswith('https://'):
-        raise ValueError('接口地址必须使用 HTTPS')
-    req = urllib.request.Request(url, json.dumps(payload).encode(), {'Content-Type':'application/json','api-key':key,'Authorization':'Bearer '+key})
+    req = urllib.request.Request(url, json.dumps(payload,ensure_ascii=False).encode('utf-8'), {'Content-Type':'application/json; charset=utf-8','api-key':key,'Authorization':'Bearer '+key})
     try:
         with urllib.request.urlopen(req, timeout=90) as response:
             result = json.load(response)
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f'MiMo HTTP {exc.code}，请检查 Key、地址、额度和模型') from None
+    except UnicodeEncodeError:
+        raise ValueError('请求头含非英文字符，尚未成功调用 MiMo。请重新复制 Key；若仍失败，请检查系统代理配置。') from None
+    except urllib.error.URLError:
+        raise RuntimeError('无法连接 MiMo，请检查网络、代理和接口地址') from None
     answer = result['choices'][0]['message']['content']
     if not isinstance(answer, str) or not answer.strip():
         raise ValueError('模型未返回回复正文')
@@ -58,48 +81,20 @@ async def recognize_image(image):
     return SimpleNamespace(text='\n'.join(row[2] for row in sorted(rows)))
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root,data_root=None):
         self.root=root
-        root.title('微信 MiMo 助手 · 气泡识别 OCR 0.4.0')
+        root.title('微信分身 Studio · 0.5.0')
         root.geometry('800x780')
         self.cfg=DEFAULT.copy()
         if (ROOT/'config.json').exists():
             try: self.cfg.update(json.loads((ROOT/'config.json').read_text('utf-8')))
             except Exception: messagebox.showwarning('配置', '配置无法读取，使用默认值')
+        if self.cfg['prompt']=='你是微信聊天助手。自然、简短地用中文回复对方，不编造事实。只输出要发送的正文。':self.cfg['prompt']=DEFAULT['prompt']
         self.events=queue.Queue(); self.stop=threading.Event(); self.running=False
         self.history=[]; self.pending=None; self.seen=set(); self.vars={}; self.awaiting=threading.Event()
         self.windows=[]; self.monitor=None; self.preview_dialog=None
-        frame=ttk.Frame(root,padding=16); frame.pack(fill='both',expand=True)
-        ttk.Label(frame,text='微信窗口截图识别 + MiMo 回复',font=('Microsoft YaHei UI',16,'bold')).pack(anchor='w')
-        ttk.Label(frame,text='仅识别你选定的窗口和当前聊天，不自动切换会话。').pack(anchor='w',pady=8)
-        row=ttk.Frame(frame); row.pack(fill='x',pady=5)
-        self.window_choice=ttk.Combobox(row,state='readonly'); self.window_choice.pack(side='left',fill='x',expand=True)
-        self.window_choice.bind('<<ComboboxSelected>>',self.choose_window)
-        ttk.Button(row,text='刷新窗口',command=self.refresh_windows).pack(side='left',padx=3)
-        ttk.Button(frame,text='查看所选窗口 / 设置发送位置',command=self.window_preview).pack(anchor='w',pady=4)
-        for name,label in [('base_url','接口地址'),('model','模型'),('title','仅回复此聊天（可留空）')]:
-            row=ttk.Frame(frame); row.pack(fill='x',pady=3)
-            ttk.Label(row,text=label,width=26).pack(side='left')
-            self.vars[name]=tk.StringVar(value=self.cfg[name]); ttk.Entry(row,textvariable=self.vars[name]).pack(side='left',fill='x',expand=True)
-        row=ttk.Frame(frame); row.pack(fill='x',pady=3)
-        ttk.Label(row,text='API Key（仅本次运行保留）',width=26).pack(side='left')
-        self.key=tk.StringVar(value=os.environ.get('MIMO_API_KEY','')); ttk.Entry(row,textvariable=self.key,show='•').pack(side='left',fill='x',expand=True)
-        row=ttk.Frame(frame); row.pack(fill='x',pady=6)
-        for label,url in [('按量付费','https://api.xiaomimimo.com/v1'),('Token Plan 中国','https://token-plan-cn.xiaomimimo.com/v1')]:
-            ttk.Button(row,text=label,command=lambda u=url:self.vars['base_url'].set(u)).pack(side='left',padx=3)
-        ttk.Label(frame,text='回复提示词').pack(anchor='w')
-        self.prompt=tk.Text(frame,height=3,wrap='word'); self.prompt.insert('1.0',self.cfg['prompt']); self.prompt.pack(fill='x')
-        self.auto=tk.BooleanVar(value=False)
-        ttk.Checkbutton(frame,text='开启自动发送（默认只生成预览）',variable=self.auto).pack(anchor='w')
-        row=ttk.Frame(frame); row.pack(fill='x',pady=8)
-        self.start_button=ttk.Button(row,text='开始监听',command=self.start); self.start_button.pack(side='left',padx=3)
-        ttk.Button(row,text='停止 / Esc',command=self.halt).pack(side='left',padx=3)
-        ttk.Button(row,text='发送当前预览',command=self.send_pending).pack(side='left',padx=3)
-        ttk.Button(row,text='保存配置',command=self.save).pack(side='left',padx=3)
-        ttk.Button(row,text='仅测试识别',command=self.test_recognition).pack(side='left',padx=3)
-        ttk.Label(frame,text='识别与回复预览（不写入磁盘）').pack(anchor='w')
-        self.output=tk.Text(frame,wrap='word',height=14,state='disabled'); self.output.pack(fill='both',expand=True)
-        self.status=tk.StringVar(value='未启动'); ttk.Label(frame,textvariable=self.status).pack(anchor='w',pady=5)
+        from studio_ui import StudioUI
+        self.studio=StudioUI(self,data_root or ROOT)
         root.bind('<Escape>',lambda _:self.halt()); root.protocol('WM_DELETE_WINDOW',self.close)
         root.after(200,self.pump)
         self.refresh_windows()
@@ -182,6 +177,7 @@ class App:
     def snapshot(self):
         cfg=dict(self.cfg); cfg.update({k:v.get().strip() for k,v in self.vars.items()})
         cfg['prompt']=self.prompt.get('1.0','end').strip(); cfg['auto']=self.auto.get()
+        cfg.update(persona_enabled=self.studio.learn.get(),longer=self.studio.longer.get(),proactive=self.studio.proactive.get(),record_contact=self.studio.binding.get())
         return cfg
 
     def save(self):
@@ -192,8 +188,8 @@ class App:
     def start(self):
         if self.running:return
         cfg=self.snapshot(); key=self.key.get().strip()
-        if not key:
-            return messagebox.showerror('尚未配置','请填写 MiMo API Key')
+        try:key,_=validate_connection(cfg,key)
+        except ValueError as exc:return messagebox.showerror('MiMo 配置需要修正',str(exc))
         if not self.monitor:return messagebox.showerror('尚未选择窗口','请在窗口列表选择微信窗口')
         if cfg['auto'] and not self.monitor['input']:
             return messagebox.showerror('确认发送位置','请先在窗口预览图上点击输入框位置')
@@ -201,6 +197,20 @@ class App:
         self.start_button.configure(state='disabled'); self.status.set('监听中（Esc 全局停止；鼠标移到屏幕左上角也会停止）')
         self.window_choice.configure(state='disabled')
         threading.Thread(target=self.worker,args=(cfg,key),daemon=True).start()
+
+    def test_connection(self):
+        if self.running:return messagebox.showinfo('测试连接','请先停止监听')
+        cfg=self.snapshot()
+        try:key,_=validate_connection(cfg,self.key.get())
+        except ValueError as exc:return messagebox.showerror('MiMo 配置需要修正',str(exc))
+        self.status.set('正在测试 MiMo 连接，不操作微信')
+        def test():
+            try:
+                completion(cfg,key,'请只回复OK',[])
+                self.events.put(('log','MiMo 连接成功：鉴权通过，模型已返回正文（未发送微信）'))
+            except Exception as exc:self.events.put(('log','MiMo 连接测试失败：'+str(exc)))
+            finally:self.events.put(('connection_done',None))
+        threading.Thread(target=test,daemon=True).start()
 
     def halted(self):
         if ctypes.windll.user32.GetAsyncKeyState(0x1B)&0x8000:self.stop.set()
@@ -238,6 +248,10 @@ class App:
             view=self.inspect(hwnd)
             if not view.title:raise ValueError('聊天标题未能可靠识别，请先点“仅测试识别”检查')
             locked_title=view.title; locked_header=view.header
+            record_contact=cfg.get('record_contact','')
+            if not record_contact or record_contact=='自动按聊天标题匹配':record_contact=locked_title
+            self.active_record_contact=record_contact
+            self.history=self.studio.store.recent(record_contact)
             tracker=vision.MessageTracker(view.messages)
             self.events.put(('log','已锁定微信：'+view.title+'；当前旧消息已忽略。'))
             candidate=''; count=0
@@ -263,7 +277,8 @@ class App:
                 if len(''.join(text.split()))>=12 and any(vision.message_equal(vision.Bubble('in',(),text),vision.Bubble('in',(),turn['content'])) for turn in self.history if turn['role']=='assistant'):
                     self.events.put(('log','已排除与本程序历史回复相同的文字')); continue
                 self.events.put(('log','['+view.title+'] 识别：'+text))
-                answer=completion(cfg,key,text,self.history)
+                reply_cfg=self.studio.reply_cfg(cfg,record_contact,text)
+                answer=completion(reply_cfg,key,text,self.history)
                 if self.halted():break
                 if not cfg['auto']:self.awaiting.set()
                 self.events.put(('preview',(view,text,answer)))
@@ -305,6 +320,7 @@ class App:
         if not vision.foreground(expected.hwnd):raise ValueError('窗口焦点变化，取消发送')
         pyautogui.press('enter')
         self.history.extend([{'role':'user','content':text},{'role':'assistant','content':answer}]); self.history=self.history[-12:]
+        if hasattr(self,'studio'):self.studio.store.remember_exchange(getattr(self,'active_record_contact',expected.title),text,answer)
         self.awaiting.clear(); self.events.put(('sent',None))
 
     def send_pending(self):
@@ -325,10 +341,12 @@ class App:
         if self.running:self.halted()
         while not self.events.empty():
             kind,value=self.events.get()
-            if kind=='log':self.log(value)
+            if kind=='ui':value()
+            elif kind=='log':self.log(value)
             elif kind=='preview':
                 self.pending=value; self.log('回复预览：'+value[2])
             elif kind=='sent':self.pending=None; self.log('已发送')
+            elif kind=='connection_done':self.status.set('MiMo 连接测试结束，详情见日志')
             elif kind=='done':self.running=False; self.start_button.configure(state='normal'); self.window_choice.configure(state='readonly'); self.status.set('已停止')
         self.root.after(200,self.pump)
 
@@ -342,24 +360,36 @@ if __name__=='__main__':
         if '--box' in sys.argv:
             x,y,w,h=map(int,sys.argv[sys.argv.index('--box')+1].split(',')); image=image.crop((x,y,x+w,y+h))
         view=asyncio.run(recognition.analyze(image,0,(0,0,image.width,image.height),recognize_image))
-        report={'version':'0.4.0','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
+        report={'version':'0.5.0','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
         (ROOT/'ocr-check.json').write_text(json.dumps(report,ensure_ascii=True,indent=2),'utf-8')
         sys.exit(0)
     if '--self-test' in sys.argv:
         assert fingerprint('你好\n 世界')==fingerprint('你好 世界')
         import pyautogui, pyperclip
         from PIL import Image, ImageDraw, ImageFont
-        window=tk.Tk(); instance=App(window); window.update()
+        import tempfile
+        from chatdata import normalize_rows
+        temporary=tempfile.TemporaryDirectory(prefix='wechat-studio-test-')
+        window=tk.Tk(); instance=App(window,Path(temporary.name))
+        fixture=[{'talkerName':'演示联系人','senderName':'我','isSelf':True,'content':text,'type':1,'createTime':str(index)} for index,text in enumerate(('行啊，等下聊','哈哈，确实有点意思','你先说说怎么想的'))]
+        fixture.append({'talkerName':'演示联系人','senderName':'朋友','isSelf':False,'content':'周末有什么安排','type':1,'createTime':'4'})
+        instance.studio.store.import_rows(normalize_rows(fixture),'self-test'); instance.studio.refresh(); window.update()
         user=ctypes.windll.user32
         user.GetAncestor.argtypes=[ctypes.c_void_p,ctypes.c_uint]; user.GetAncestor.restype=ctypes.c_void_p
         hwnd=user.GetAncestor(window.winfo_id(),2)
         captured,bounds=vision.capture_window(hwnd,os.getpid())
         assert captured.size==bounds[2:], (captured.size,bounds)
+        captured.save(ROOT/'studio-self-test.png')
+        for name,filename in [('模型与工具','settings'),('回复试验室','lab'),('微信自动回复','automation'),('聊天记录','records')]:
+            instance.studio.show(name); window.update()
+            page_image,_=vision.capture_window(hwnd,os.getpid())
+            page_image.save(ROOT/('ui-self-test-'+filename+'.png'))
         window.withdraw(); window.update(); window.destroy()
+        temporary.cleanup()
         sample=Image.new('RGB',(600,100),'white')
         ImageDraw.Draw(sample).text((10,10),'你好 微信 测试',font=ImageFont.truetype('msyh.ttc',32),fill='black')
         result=asyncio.run(recognize_image(sample))
         assert '你好' in ''.join(result.text.split()), repr(result.text)
-        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 0.4.0: GUI + locked HWND capture + bundled RapidOCR model','utf-8')
+        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 0.5.0: Studio pages + isolated demo corpus + locked HWND capture + bundled RapidOCR model','utf-8')
         sys.exit(0)
     App(tk.Tk()).root.mainloop()
