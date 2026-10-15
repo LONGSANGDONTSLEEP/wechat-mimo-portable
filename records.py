@@ -30,11 +30,14 @@ def export_file(path, rows):
     path = Path(path)
     # Same portable field schema for round trips across all export formats.
     data = [dict(contact=r['contact'], sender=r['sender'], role=r['role'], time=r['ts'], content=r['content']) for r in rows]
+    typed=any('kind' in r for r in rows)
+    if typed:
+        for item,row in zip(data,rows):item['type']=str(row.get('kind',1))
     if path.suffix.lower() == '.json':
         path.write_text(json.dumps({'messages': data}, ensure_ascii=False, indent=2), 'utf-8')
     elif path.suffix.lower() == '.csv':
         with path.open('w', encoding='utf-8-sig', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=['contact','sender','role','time','content'])
+            writer = csv.DictWriter(stream, fieldnames=['contact','sender','role','time','content']+(['type'] if typed else []))
             writer.writeheader()
             # Spreadsheet formulas must stay plain text when CSV is opened in Excel.
             writer.writerows({k: "'"+v if v.startswith(('=','+','-','@','\t','\r')) else v for k,v in row.items()} for row in data)

@@ -22,6 +22,7 @@ class OllamaTests(unittest.TestCase):
                 self.assertEqual(app.completion(cfg,'sk-fake-cloud-key','中文消息',[]),'本地回复')
                 self.assertNotIn('authorization',{k.lower():v for k,v in captured['headers'].items()})
                 self.assertNotIn('api-key',{k.lower():v for k,v in captured['headers'].items()})
+                self.assertEqual(captured['body']['reasoning_effort'],'none')
             self.assertEqual(captured['path'],'/v1/chat/completions')
             self.assertNotIn('api-key',{k.lower():v for k,v in captured['headers'].items()})
             self.assertNotIn('authorization',{k.lower():v for k,v in captured['headers'].items()})

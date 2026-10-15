@@ -31,4 +31,13 @@ class PersonaPipeline(unittest.TestCase):
         cfg=dict(app.DEFAULT,persona_enabled=False,proactive=False)
         self.assertEqual(ui.reply_cfg(cfg,'甲','你好')['prompt'],cfg['prompt'])
 
+    def test_retrieved_history_preserves_the_message_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=ChatStore(Path(directory)/'memory.sqlite3')
+            store.import_rows(normalize_rows([dict(contact='甲',sender='我',isSelf=True,time='2020-01-02',content='明天下午去公园骑车吧')]),'fixture')
+            context=store.context('甲','去公园骑车吗')
+            self.assertEqual(len(context),1)
+            self.assertIn('2020-01-02',context[0])
+            self.assertIn('明天下午',context[0])
+
 if __name__=='__main__':unittest.main()
