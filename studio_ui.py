@@ -1,41 +1,39 @@
-"""Unified desktop workspace for WeTrace exports, persona memory and OCR replies."""
+"""Independent desktop workspace for records, AI analysis, persona memory and OCR replies."""
 import json
 import os
+import sys
 from pathlib import Path
-import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk,filedialog,messagebox
 import urllib.request
-import webbrowser
 from chatdata import ChatStore,read_rows,normalize_rows,ALIASES
 
 class StudioUI:
     def __init__(self,app,root_path):
         self.app=app; self.root=app.root; self.root_path=Path(root_path)
         self.store=ChatStore(self.root_path/'data'/'persona.sqlite3')
-        self.pages={}; self.nav={}; self.tool_process=None; self.tool_log=None
+        self.pages={}; self.nav={}; self.record_offset=0
         self.learn=tk.BooleanVar(value=self.store.get('learn',True))
         self.longer=tk.BooleanVar(value=self.store.get('longer',True))
         self.proactive=tk.BooleanVar(value=self.store.get('proactive',True))
         self.binding=tk.StringVar(value=self.store.get('binding','自动按聊天标题匹配'))
         self.lab_contact=tk.StringVar(); self.memory_contact=tk.StringVar()
-        self.backend=tk.StringVar(value=str(self.root_path/'vendor'/'wetrace'/'wetrace.exe'))
         self._style()
-        self.root.title('微信分身 Studio · 0.5.1')
+        self.root.title('微信分身 Studio · 1.0.0')
         self.root.geometry('1180x850'); self.root.minsize(1040,760)
         shell=ttk.Frame(self.root); shell.pack(fill='both',expand=True)
         rail=tk.Frame(shell,bg='#152538',width=205); rail.pack(side='left',fill='y'); rail.pack_propagate(False)
         tk.Label(rail,text='微信分身',font=('Microsoft YaHei UI',22,'bold'),fg='white',bg='#152538').pack(anchor='w',padx=22,pady=(32,0))
         tk.Label(rail,text='STUDIO  /  本地记忆工作台',font=('Microsoft YaHei UI',9),fg='#9bb0c7',bg='#152538').pack(anchor='w',padx=23,pady=(6,30))
         body=ttk.Frame(shell,padding=(30,24)); body.pack(side='left',fill='both',expand=True)
-        for name in ('总览','聊天记录','我的分身','联系人记忆','回复试验室','微信自动回复','模型与工具'):
+        for name in ('总览','聊天记录','我的分身','联系人记忆','AI 工具箱','聊天统计','回复试验室','微信自动回复','模型与工具'):
             page=ttk.Frame(body); page.place(relx=0,rely=0,relwidth=1,relheight=1)
             self.pages[name]=page
-            button=tk.Button(rail,text=name,anchor='w',relief='flat',bd=0,bg='#152538',fg='#c8d5e5',activebackground='#253d55',activeforeground='white',font=('Microsoft YaHei UI',12),padx=24,pady=13,command=lambda n=name:self.show(n))
+            button=tk.Button(rail,text=name,anchor='w',relief='flat',bd=0,bg='#152538',fg='#c8d5e5',activebackground='#253d55',activeforeground='white',font=('Microsoft YaHei UI',12),padx=24,pady=9,command=lambda n=name:self.show(n))
             button.pack(fill='x',padx=10,pady=2); self.nav[name]=button
-        tk.Label(rail,text='记录保存在本机\n支持 MiMo / 本地 Ollama',justify='left',font=('Microsoft YaHei UI',9),fg='#9bb0c7',bg='#152538',wraplength=170).pack(side='bottom',padx=20,pady=30)
-        self.overview(); self.corpus(); self.persona(); self.memories(); self.laboratory(); self.automation(); self.settings()
+        tk.Label(rail,text='记录保存在本机\nMiMo / Ollama / LM Studio',justify='left',font=('Microsoft YaHei UI',9),fg='#9bb0c7',bg='#152538',wraplength=170).pack(side='bottom',padx=20,pady=30)
+        self.overview(); self.corpus(); self.persona(); self.memories(); self.laboratory(); self.analysis_page(); self.statistics_page(); self.automation(); self.settings()
         ttk.Label(self.root,textvariable=app.status,padding=(220,8),style='Hint.TLabel').pack(side='bottom',fill='x')
         self.refresh(); self.show('总览')
 
@@ -83,7 +81,7 @@ class StudioUI:
         threading.Thread(target=thread,daemon=True).start()
 
     def overview(self):
-        page=self.pages['总览']; self.heading(page,'让回复，更像你','导入 WeTrace 记录，确认本人身份，先在试验室检查，再接入微信。')
+        page=self.pages['总览']; self.heading(page,'让回复，更像你','记录管理、AI 分析、个人分身与窗口回复，一个 App 完成。')
         row=ttk.Frame(page); row.pack(fill='x',pady=10); self.metrics={}
         for name,label in [('total','已导入消息'),('self','本人消息'),('contacts','联系人'),('unknown','待确认身份')]:
             card=tk.Frame(row,bg='white',padx=20,pady=20); card.pack(side='left',fill='both',expand=True,padx=(0,12))
@@ -93,23 +91,31 @@ class StudioUI:
         for title,description,target in [
             ('01  导入你的历史','导入 JSON / CSV 或 WeTrace HTML 备份；先预览，再入库。','聊天记录'),
             ('02  建立你的分身','只用本人消息学习语气，给每位联系人保留独立记忆。','我的分身'),
-            ('03  试着聊一聊','检查表达风格和引用的记忆，不直接发送到微信。','回复试验室'),
+            ('03  回顾最近的聊天','按当前时间筛选，生成摘要、待办和关键信息。','AI 工具箱'),
             ('04  接入当前聊天','锁定微信窗口，OCR 识别，默认预览后发送。','微信自动回复')]:
             card=ttk.LabelFrame(page,text=title,padding=16); card.pack(fill='x',pady=8)
             ttk.Label(card,text=description).pack(side='left'); ttk.Button(card,text='打开 →',command=lambda t=target:self.show(t)).pack(side='right')
         self.overview_note=ttk.Label(page,text='',style='Hint.TLabel',wraplength=850); self.overview_note.pack(anchor='w',pady=16)
 
     def corpus(self):
-        page=self.pages['聊天记录']; self.heading(page,'聊天记录','支持你这份 WeTrace 的 window.CHAT_DATA HTML 导出；不会执行导出文件中的脚本。')
+        page=self.pages['聊天记录']; self.heading(page,'聊天记录','导入 JSON / CSV / HTML / TXT；支持 WeTrace 导出。搜索、浏览和再导出都在本 App 完成。')
         row=ttk.Frame(page); row.pack(fill='x')
         ttk.Button(row,text='＋ 导入文件',style='Accent.TButton',command=self.import_files).pack(side='left',padx=(0,8))
         ttk.Button(row,text='导入 HTML 备份文件夹',command=self.import_folder).pack(side='left',padx=4)
-        ttk.Button(row,text='启动 WeTrace 导出工具',command=self.start_wetrace).pack(side='left',padx=4)
-        ttk.Button(row,text='导出所选记录',command=self.export_contact).pack(side='right')
+        ttk.Button(row,text='导出完整会话',command=self.export_contact).pack(side='right')
         row=ttk.Frame(page); row.pack(fill='x',pady=14)
         self.contact_choice=ttk.Combobox(row,state='readonly'); self.contact_choice.pack(side='left',fill='x',expand=True)
-        self.contact_choice.bind('<<ComboboxSelected>>',lambda e:self.show_messages())
+        self.contact_choice.bind('<<ComboboxSelected>>',lambda e:self.reset_records())
         ttk.Button(row,text='刷新',command=self.refresh).pack(side='left',padx=6)
+        row=ttk.Frame(page); row.pack(fill='x',pady=(0,10))
+        self.search_var=tk.StringVar()
+        search=ttk.Entry(row,textvariable=self.search_var); search.pack(side='left',fill='x',expand=True); search.bind('<Return>',lambda e:self.reset_records())
+        ttk.Button(row,text='搜索',command=self.reset_records).pack(side='left',padx=5)
+        ttk.Button(row,text='全部会话',command=self.all_contacts).pack(side='left')
+        self.record_count=tk.StringVar(); ttk.Label(row,textvariable=self.record_count).pack(side='left',padx=12)
+        row=ttk.Frame(page); row.pack(fill='x',pady=(0,8))
+        self.prev_records=ttk.Button(row,text='上一页',command=lambda:self.page_records(-1)); self.prev_records.pack(side='left')
+        self.next_records=ttk.Button(row,text='下一页',command=lambda:self.page_records(1)); self.next_records.pack(side='left',padx=6)
         columns=('time','sender','role','text')
         self.message_table=ttk.Treeview(page,columns=columns,show='headings',height=15)
         for key,label,width in [('time','时间',135),('sender','发送者',110),('role','身份',65),('text','内容',480)]:
@@ -143,7 +149,7 @@ class StudioUI:
     def import_preview(self,result):
         loaded,errors=result
         if not loaded:return messagebox.showerror('未找到消息','\n'.join(errors[:8]) or '没有可导入文件')
-        dialog=tk.Toplevel(self.root); dialog.title('导入预览 · 确认本人身份'); dialog.geometry('1000x650'); dialog.transient(self.root); dialog.grab_set()
+        dialog=tk.Toplevel(self.root); dialog.title('导入预览 · 确认本人身份'); dialog.geometry('1180x650'); dialog.transient(self.root); dialog.grab_set()
         frame=ttk.Frame(dialog,padding=20); frame.pack(fill='both',expand=True)
         ttk.Label(frame,text='先确认谁是你，再开始学习',font=('Microsoft YaHei UI',17,'bold')).pack(anchor='w')
         ttk.Label(frame,text='有 isSelf / IsSender 标记时自动识别。没有标记时，填写你在导出记录中的准确称呼，以分号分隔。',wraplength=950).pack(anchor='w',pady=8)
@@ -151,7 +157,7 @@ class StudioUI:
         row=ttk.Frame(frame); row.pack(fill='x',pady=6); ttk.Label(row,text='我的称呼').pack(side='left'); ttk.Entry(row,textvariable=aliases).pack(side='left',fill='x',expand=True,padx=10)
         mapping={}; keys=sorted({str(k) for row in loaded[0][1][:100] for k in row})
         row=ttk.Frame(frame); row.pack(fill='x',pady=5)
-        for key,label in [('text','消息列'),('sender','发送者列'),('self','本人标记列'),('contact','联系人列')]:
+        for key,label in [('text','消息列'),('sender','发送者列'),('self','本人标记列'),('contact','联系人列'),('time','时间列')]:
             ttk.Label(row,text=label).pack(side='left',padx=4)
             var=tk.StringVar(value='自动'); mapping[key]=var
             ttk.Combobox(row,textvariable=var,values=['自动']+keys,state='readonly',width=13).pack(side='left')
@@ -192,17 +198,32 @@ class StudioUI:
         stats=self.store.stats()
         for key,var in self.metrics.items():var.set(str(stats[key]))
         contacts=[r['contact'] for r in self.store.contacts()]
-        for combo in (self.contact_choice,self.memory_combo,self.lab_combo):combo['values']=contacts
+        for combo in (self.contact_choice,self.memory_combo,self.lab_combo,self.analysis_contact,self.stats_contact):combo['values']=contacts
         self.binding_combo['values']=['自动按聊天标题匹配']+contacts
         if contacts and not self.contact_choice.get():self.contact_choice.set(contacts[0])
         if contacts and not self.memory_contact.get():self.memory_contact.set(contacts[0])
         if contacts and not self.lab_contact.get():self.lab_contact.set(contacts[0])
+        for combo in (self.analysis_contact,self.stats_contact):
+            if contacts and not combo.get():combo.set(contacts[0])
         style=self.store.style(); self.set_text(self.style_view,style['summary']+'\n\n本人示例（仅供学习语气）：\n\n'+'\n\n'.join(style['examples']))
         self.overview_note.configure(text=style['summary'])
         self.show_messages(); self.load_memories()
 
+    def all_contacts(self):
+        self.contact_choice.set(''); self.reset_records()
+
+    def reset_records(self):
+        self.record_offset=0; self.show_messages()
+
+    def page_records(self,direction):
+        self.record_offset=max(0,self.record_offset+direction*200); self.show_messages()
+
     def show_messages(self):
-        self.visible_rows=self.store.messages(self.contact_choice.get(),500)
+        from records import query
+        self.visible_rows,total=query(self.store,self.contact_choice.get(),self.search_var.get().strip(),self.record_offset)
+        self.record_count.set(f'{total} 条 · 第 {self.record_offset//200+1} 页（每页200条）')
+        self.prev_records.configure(state='normal' if self.record_offset else 'disabled')
+        self.next_records.configure(state='normal' if self.record_offset+200<total else 'disabled')
         self.message_table.delete(*self.message_table.get_children())
         for index,row in enumerate(self.visible_rows):self.message_table.insert('', 'end',iid=str(index),values=(row['ts'],row['sender'],{'self':'本人','other':'对方','unknown':'未知'}[row['role']],row['content'][:200]))
 
@@ -211,16 +232,14 @@ class StudioUI:
         if selected:messagebox.showinfo('消息详情',self.visible_rows[int(selected[0])]['content'])
 
     def export_contact(self):
+        from records import all_rows,export_file
         contact=self.contact_choice.get()
-        if not contact:return
-        path=filedialog.asksaveasfilename(defaultextension='.json',filetypes=[('JSON','*.json')],title='导出所选联系人的本地记录')
+        path=filedialog.asksaveasfilename(defaultextension='.json',filetypes=[('JSON','*.json'),('CSV','*.csv'),('HTML','*.html')],title='导出完整会话（不受搜索和分页限制）')
         if not path:return
-        records=self.store.messages(contact,1000000)
-        rows=[dict(contact=r['contact'],sender=r['sender'],role=r['role'],time=r['ts'],content=r['content']) for r in records]
-        Path(path).write_text(json.dumps({'messages':rows},ensure_ascii=False,indent=2),'utf-8'); self.app.status.set('记录已导出到所选位置')
+        self.run(lambda:export_file(path,all_rows(self.store,contact)),lambda count:self.app.status.set(f'已导出 {count} 条消息到所选位置'))
 
     def persona(self):
-        page=self.pages['我的分身']; self.heading(page,'我的分身','从已确认的本人消息中提取风格；这是风格示例与记忆增强，不是重新训练 MiMo 底层模型。')
+        page=self.pages['我的分身']; self.heading(page,'我的分身','从已确认的本人消息中提取风格；这是风格示例与记忆增强，不是修改模型参数。')
         for label,var in [('使用我的聊天风格',self.learn),('回应更充分：接住话题，通常2至5句',self.longer),('更主动接话：自然追问，不机械反问',self.proactive)]:ttk.Checkbutton(page,text=label,variable=var,command=self.save_persona).pack(anchor='w',pady=6)
         ttk.Label(page,text='自动回复使用的记录联系人（标题与导出名称不同时可手动绑定）').pack(anchor='w',pady=(16,5))
         self.binding_combo=ttk.Combobox(page,textvariable=self.binding,state='readonly'); self.binding_combo.pack(fill='x'); self.binding_combo.bind('<<ComboboxSelected>>',lambda e:self.save_persona())
@@ -254,7 +273,7 @@ class StudioUI:
         if selected:self.store.delete_memory(self.memory_rows[selected[0]]['id']); self.load_memories()
 
     def laboratory(self):
-        page=self.pages['回复试验室']; self.heading(page,'先聊一聊，检查像不像你','这里不会操作微信。风格、记忆和相关片段交给选定的模型：支持 MiMo 或本地 Ollama。')
+        page=self.pages['回复试验室']; self.heading(page,'先聊一聊，检查像不像你','这里不会操作微信。风格、记忆和相关片段交给选定的模型：支持 MiMo、LM Studio 或 Ollama。')
         self.lab_combo=ttk.Combobox(page,textvariable=self.lab_contact,state='readonly'); self.lab_combo.pack(fill='x')
         ttk.Label(page,text='对方说了什么').pack(anchor='w',pady=(15,4))
         self.lab_input=tk.Text(page,height=4,font=('Microsoft YaHei UI',11),relief='flat',wrap='word',padx=12,pady=10); self.lab_input.pack(fill='x')
@@ -262,6 +281,117 @@ class StudioUI:
         self.lab_button=ttk.Button(row,text='生成我的风格回复',style='Accent.TButton',command=self.lab_reply); self.lab_button.pack(side='left')
         ttk.Button(row,text='查看本次使用的提示与记忆',command=self.inspect_prompt).pack(side='left',padx=8)
         self.lab_output=self.text(page,12)
+
+    def analysis_page(self):
+        from toolbox import RANGES,TASKS
+        page=self.pages['AI 工具箱']
+        self.heading(page,'AI 工具箱','分析已导入的记录。最近一周按现在向前7天计算；没有近期消息不会使用旧记录替代。')
+        self.analysis_contact=ttk.Combobox(page,state='readonly'); self.analysis_contact.pack(fill='x')
+        row=ttk.Frame(page); row.pack(fill='x',pady=12)
+        self.analysis_range=tk.StringVar(value=next(iter(RANGES)))
+        self.range_combo=ttk.Combobox(row,textvariable=self.analysis_range,values=list(RANGES)+['自定义日期'],state='readonly',width=22); self.range_combo.pack(side='left')
+        self.date_start=tk.StringVar(); self.date_end=tk.StringVar()
+        ttk.Label(row,text='从').pack(side='left',padx=(10,3))
+        self.start_date_entry=ttk.Entry(row,textvariable=self.date_start,width=12); self.start_date_entry.pack(side='left')
+        ttk.Label(row,text='至').pack(side='left',padx=3)
+        self.end_date_entry=ttk.Entry(row,textvariable=self.date_end,width=12); self.end_date_entry.pack(side='left')
+        self.start_date_entry.configure(state='disabled'); self.end_date_entry.configure(state='disabled')
+        def change_range(event=None):
+            state='normal' if self.analysis_range.get()=='自定义日期' else 'disabled'
+            self.start_date_entry.configure(state=state); self.end_date_entry.configure(state=state)
+            self.invalidate_analysis()
+        self.range_combo.bind('<<ComboboxSelected>>',change_range)
+        self.analysis_contact.bind('<<ComboboxSelected>>',lambda e:self.invalidate_analysis())
+        self.date_start.trace_add('write',lambda *args:self.invalidate_analysis())
+        self.date_end.trace_add('write',lambda *args:self.invalidate_analysis())
+        ttk.Label(page,text='自定义格式 YYYY-MM-DD，包含结束当天；统一使用北京时间 UTC+8。',style='Hint.TLabel').pack(anchor='w')
+        row=ttk.Frame(page); row.pack(fill='x',pady=12)
+        self.analysis_task=ttk.Combobox(row,values=list(TASKS),state='readonly',width=16); self.analysis_task.set('对话摘要'); self.analysis_task.pack(side='left')
+        ttk.Button(row,text='检查范围 / 预览消息',command=self.preview_analysis).pack(side='left',padx=8)
+        self.analysis_button=ttk.Button(row,text='开始分析',style='Accent.TButton',command=self.generate_analysis); self.analysis_button.pack(side='left')
+        self.analysis_cancel=threading.Event()
+        ttk.Button(row,text='停止',command=self.stop_analysis).pack(side='left',padx=6)
+        ttk.Button(row,text='导出结果',command=self.export_analysis).pack(side='right')
+        self.analysis_meta=tk.StringVar(value='先选择会话和范围，再预览或分析。')
+        ttk.Label(page,textvariable=self.analysis_meta,style='Hint.TLabel',wraplength=850).pack(anchor='w',pady=6)
+        self.analysis_output=self.text(page,16)
+        self.set_text(self.analysis_output,'支持 MiMo / LM Studio / Ollama。分析使用“模型与工具”中的服务配置。\n\n只提交所选日期范围内的消息；较长记录会分段分析后合并，进度会显示在这里。')
+
+    def invalidate_analysis(self):
+        if hasattr(self,'analysis_meta'):self.analysis_meta.set('筛选条件已改变，请重新检查范围。')
+
+    def analysis_selection(self):
+        from toolbox import select_messages
+        # Capture all Tk values on the UI thread, before entering the worker.
+        contact=self.analysis_contact.get(); choice=self.analysis_range.get()
+        first=self.date_start.get(); last=self.date_end.get()
+        return lambda:select_messages(self.store,contact,choice,first,last)
+
+    def preview_analysis(self):
+        from toolbox import describe,transcript
+        work=self.analysis_selection()
+        def done(selection):
+            self.analysis_meta.set(describe(selection))
+            dialog=tk.Toplevel(self.root); dialog.title('所选消息预览 · 未调用模型'); dialog.geometry('900x650')
+            self.set_text(self.text(dialog,25),describe(selection)+'\n\n'+(transcript(selection) or '该时间范围无消息；不会回退到旧记录。'))
+        self.run(work,done)
+
+    def generate_analysis(self):
+        from app import completion,validate_connection
+        from toolbox import analyze,describe
+        select=self.analysis_selection(); cfg=self.app.snapshot(); task=self.analysis_task.get()
+        try:key,_=validate_connection(cfg,self.app.key.get())
+        except ValueError as exc:return messagebox.showerror('模型配置',str(exc))
+        self.analysis_cancel.clear()
+        self.analysis_button.configure(state='disabled')
+        self.set_text(self.analysis_output,'正在检查日期范围…')
+        def progress(text):self.app.events.put(('ui',lambda value=text:self.set_text(self.analysis_output,value)))
+        def work():
+            try:
+                selection=select()
+                self.app.events.put(('ui',lambda value=describe(selection):self.analysis_meta.set(value)))
+                return analyze(selection,task,cfg,key,completion,progress,self.analysis_cancel.is_set)
+            except Exception as exc:return '分析未完成：'+str(exc)
+        def done(result):
+            self.set_text(self.analysis_output,result); self.analysis_button.configure(state='normal')
+        self.run(work,done)
+
+    def stop_analysis(self):
+        self.analysis_cancel.set()
+        self.app.status.set('已请求停止分析；当前模型请求结束后，不再提交后续片段。')
+
+    def export_analysis(self):
+        path=filedialog.asksaveasfilename(title='保存分析结果',defaultextension='.txt',filetypes=[('文本','*.txt'),('Markdown','*.md')])
+        if path:
+            try:Path(path).write_text(self.analysis_output.get('1.0','end').strip(),'utf-8')
+            except OSError as exc:return messagebox.showerror('无法保存',str(exc))
+            self.app.status.set('分析结果已保存')
+
+    def statistics_page(self):
+        page=self.pages['聊天统计']; self.heading(page,'聊天统计','本地计算文本消息数量和活跃时段，不调用模型；无法识别的日期单独列出。')
+        row=ttk.Frame(page); row.pack(fill='x')
+        self.stats_contact=ttk.Combobox(row,state='readonly'); self.stats_contact.pack(side='left',fill='x',expand=True)
+        self.stats_contact.bind('<<ComboboxSelected>>',lambda e:self.load_statistics())
+        ttk.Button(row,text='统计所选会话',command=self.load_statistics).pack(side='left',padx=6)
+        ttk.Button(row,text='统计全部',command=lambda:self.load_statistics(True)).pack(side='left')
+        self.stats_summary=tk.StringVar(value='选择会话后点击统计。')
+        ttk.Label(page,textvariable=self.stats_summary,wraplength=850,style='Hint.TLabel').pack(anchor='w',pady=15)
+        self.stats_chart=tk.Canvas(page,height=200,bg='white',highlightthickness=0); self.stats_chart.pack(fill='x')
+        self.stats_text=self.text(page,9)
+
+    def load_statistics(self,all_contacts=False):
+        from records import statistics
+        contact='' if all_contacts else self.stats_contact.get()
+        def done(stats):
+            self.stats_summary.set(f"{'全部会话' if not contact else contact} · {stats['total']} 条文本 · 本人 {stats['own']} 条 · 身份未知 {stats['unknown']} 条\n日期：{stats['first'] or '未知'} 至 {stats['last'] or '未知'}；日期无效 {stats['invalid']} 条")
+            chart=self.stats_chart; chart.delete('all'); width=max(600,chart.winfo_width()); peak=max(stats['hours'].values(),default=1)
+            for hour in range(24):
+                count=stats['hours'][hour]; x=20+hour*(width-40)/24; bar=(width-40)/24-4; height=135*count/peak
+                chart.create_rectangle(x,165-height,x+bar,165,fill='#176bde',outline='')
+                chart.create_text(x+bar/2,181,text=str(hour),fill='#687b91')
+                if count:chart.create_text(x+bar/2,155-height,text=str(count),font=('Microsoft YaHei UI',8))
+            self.set_text(self.stats_text,'北京时间 0–23 时消息分布\n\n最活跃日期：\n'+'\n'.join(f'{day}：{count} 条' for day,count in stats['days'].most_common(10))+'\n\n发送者：\n'+'\n'.join(f'{sender}：{count} 条' for sender,count in stats['senders'].most_common(10)))
+        self.run(lambda:statistics(self.store,contact),done)
 
     def reply_cfg(self,cfg,contact,query):
         copy=dict(cfg)
@@ -335,12 +465,15 @@ class StudioUI:
         app.prompt=tk.Text(page,height=4,font=('Microsoft YaHei UI',10),wrap='word',relief='flat',padx=12,pady=10); app.prompt.insert('1.0',app.cfg['prompt']); app.prompt.pack(fill='x')
         ttk.Button(page,text='保存模型配置',style='Accent.TButton',command=app.save).pack(anchor='w',pady=10)
         ttk.Separator(page).pack(fill='x',pady=12)
-        ttk.Label(page,text='WeTrace 便携组件').pack(anchor='w'); ttk.Entry(page,textvariable=self.backend).pack(fill='x',pady=5)
-        row=ttk.Frame(page); row.pack(fill='x',pady=6)
-        ttk.Button(row,text='启动并打开 WeTrace',command=self.start_wetrace).pack(side='left')
-        ttk.Button(row,text='选择已有 WeTrace.exe',command=self.choose_backend).pack(side='left',padx=6)
-        ttk.Label(page,text='WeTrace 导出中心在独立工具窗口打开；导出后回到“聊天记录”导入。WeTrace 组件沿用原作者非商业许可证。',style='Hint.TLabel',wraplength=850).pack(anchor='w',pady=8)
+        ttk.Label(page,text='独立便携版 · 记录导入、查看、导出和分析均由本 App 完成。无需 WeTrace 运行组件。',style='Hint.TLabel',wraplength=850).pack(anchor='w',pady=8)
+        ttk.Button(page,text='开源许可证',command=self.show_licenses).pack(anchor='w',pady=6)
         ttk.Label(page,text='本地记录库：'+str(self.store.path),style='Hint.TLabel',wraplength=850).pack(anchor='w',pady=8)
+
+    def show_licenses(self):
+        base=Path(getattr(sys,'_MEIPASS',Path(__file__).parent))
+        files=[base/'LICENSE']+sorted((base/'THIRD_PARTY_LICENSES').rglob('*'))
+        dialog=tk.Toplevel(self.root); dialog.title('本项目及第三方许可证'); dialog.geometry('900x650')
+        self.set_text(self.text(dialog,25),'\n\n'.join(f'── {path.relative_to(base)} ──\n'+path.read_text('utf-8',errors='replace') for path in files if path.is_file()))
 
     def change_provider(self,event=None):
         provider={'本机 Ollama':'ollama','本机 LM Studio':'lmstudio'}.get(self.provider_choice.get(),'mimo')
@@ -377,35 +510,3 @@ class StudioUI:
                 self.app.status.set(f'已读取 {len(models)} 个本地模型，请选择后测试连接')
             else:self.app.status.set('未找到模型，请先在本地服务中下载并加载模型；不自动下载')
         self.run(work,done)
-
-    def choose_backend(self):
-        path=filedialog.askopenfilename(title='选择 WeTrace.exe',filetypes=[('程序','*.exe')])
-        if path:self.backend.set(path)
-
-    def start_wetrace(self):
-        path=Path(self.backend.get())
-        if not path.is_file():return messagebox.showerror('缺少组件','请在模型与工具页选择已有WeTrace.exe，或使用完整便携ZIP')
-        def ready():
-            try:
-                with urllib.request.urlopen('http://127.0.0.1:5200/',timeout=1) as response:return response.status==200
-            except Exception:return False
-        def work():
-            if not ready():
-                if self.tool_process and self.tool_process.poll() is None:return 'WeTrace 正在启动，请稍后再点一次'
-                logs=self.root_path/'data'/'logs'; logs.mkdir(parents=True,exist_ok=True)
-                self.tool_log=open(logs/'wetrace.log','ab')
-                self.tool_process=subprocess.Popen([str(path)],cwd=str(path.parent),stdout=self.tool_log,stderr=self.tool_log,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-                import time
-                for _ in range(30):
-                    if ready():break
-                    if self.tool_process.poll() is not None:raise ValueError('WeTrace启动失败，请查看data/logs/wetrace.log；纯净电脑可能需要安装组件目录中的VC运行库')
-                    time.sleep(.3)
-                else:raise ValueError('WeTrace尚未就绪，请查看data/logs/wetrace.log')
-            edge_paths=[Path(os.environ.get(key,''))/'Microsoft'/'Edge'/'Application'/'msedge.exe' for key in ('ProgramFiles(x86)','ProgramFiles')]
-            edge=next((candidate for candidate in edge_paths if candidate.is_file()),None)
-            if edge:
-                profile=self.root_path/'data'/'webview'
-                subprocess.Popen([str(edge),'--app=http://127.0.0.1:5200/','--user-data-dir='+str(profile),'--no-first-run'])
-            else:webbrowser.open('http://127.0.0.1:5200/')
-            return 'WeTrace 导出中心已打开，完成导出后回到本 App 导入'
-        self.app.status.set('正在启动 WeTrace…'); self.run(work,lambda message:self.app.status.set(message))

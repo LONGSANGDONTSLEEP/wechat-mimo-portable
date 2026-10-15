@@ -57,7 +57,7 @@ def completion(cfg, key, text, history):
     key,url=validate_connection(cfg,key)
     local=cfg.get('provider','mimo') in ('ollama','lmstudio')
     payload = dict(model=cfg['model'], messages=[{'role':'system','content':cfg['prompt']}]+history[-12:]+[{'role':'user','content':text}], stream=False)
-    payload['max_tokens' if local else 'max_completion_tokens']=2048
+    payload['max_tokens' if local else 'max_completion_tokens']=int(cfg.get('max_tokens',2048))
     headers={'Content-Type':'application/json; charset=utf-8'}
     if not local:headers.update({'api-key':key,'Authorization':'Bearer '+key})
     req = urllib.request.Request(url, json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers)
@@ -96,7 +96,7 @@ async def recognize_image(image):
 class App:
     def __init__(self, root,data_root=None):
         self.root=root
-        root.title('微信分身 Studio · 0.5.1')
+        root.title('微信分身 Studio · 1.0.0')
         root.geometry('800x780')
         self.cfg=DEFAULT.copy()
         if (ROOT/'config.json').exists():
@@ -364,7 +364,8 @@ class App:
             elif kind=='done':self.running=False; self.start_button.configure(state='normal'); self.window_choice.configure(state='readonly'); self.status.set('已停止')
         self.root.after(200,self.pump)
 
-    def close(self):self.halt(); self.root.destroy()
+    def close(self):
+        self.halt(); self.studio.analysis_cancel.set(); self.root.destroy()
 
 if __name__=='__main__':
     vision.enable_dpi_awareness()
@@ -374,7 +375,7 @@ if __name__=='__main__':
         if '--box' in sys.argv:
             x,y,w,h=map(int,sys.argv[sys.argv.index('--box')+1].split(',')); image=image.crop((x,y,x+w,y+h))
         view=asyncio.run(recognition.analyze(image,0,(0,0,image.width,image.height),recognize_image))
-        report={'version':'0.5.1','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
+        report={'version':'1.0.0','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
         (ROOT/'ocr-check.json').write_text(json.dumps(report,ensure_ascii=True,indent=2),'utf-8')
         sys.exit(0)
     if '--self-test' in sys.argv:
@@ -394,7 +395,7 @@ if __name__=='__main__':
         captured,bounds=vision.capture_window(hwnd,os.getpid())
         assert captured.size==bounds[2:], (captured.size,bounds)
         captured.save(ROOT/'studio-self-test.png')
-        for name,filename in [('模型与工具','settings'),('回复试验室','lab'),('微信自动回复','automation'),('聊天记录','records')]:
+        for name,filename in [('模型与工具','settings'),('回复试验室','lab'),('微信自动回复','automation'),('聊天记录','records'),('AI 工具箱','toolbox'),('聊天统计','statistics')]:
             instance.studio.show(name); window.update()
             page_image,_=vision.capture_window(hwnd,os.getpid())
             page_image.save(ROOT/('ui-self-test-'+filename+'.png'))
@@ -404,6 +405,6 @@ if __name__=='__main__':
         ImageDraw.Draw(sample).text((10,10),'你好 微信 测试',font=ImageFont.truetype('msyh.ttc',32),fill='black')
         result=asyncio.run(recognize_image(sample))
         assert '你好' in ''.join(result.text.split()), repr(result.text)
-        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 0.5.1: Studio pages + isolated demo corpus + locked HWND capture + bundled RapidOCR model','utf-8')
+        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 1.0.0: Studio pages + isolated demo corpus + locked HWND capture + bundled RapidOCR model','utf-8')
         sys.exit(0)
     App(tk.Tk()).root.mainloop()
