@@ -13,14 +13,14 @@ class StudioUI:
     def __init__(self,app,root_path):
         self.app=app; self.root=app.root; self.root_path=Path(root_path)
         self.store=ChatStore(self.root_path/'data'/'persona.sqlite3')
-        self.pages={}; self.nav={}; self.record_offset=0
+        self.pages={}; self.nav={}; self.record_offset=0; self.jobs=0
         self.learn=tk.BooleanVar(value=self.store.get('learn',True))
         self.longer=tk.BooleanVar(value=self.store.get('longer',True))
         self.proactive=tk.BooleanVar(value=self.store.get('proactive',True))
         self.binding=tk.StringVar(value=self.store.get('binding','自动按聊天标题匹配'))
         self.lab_contact=tk.StringVar(); self.memory_contact=tk.StringVar()
         self._style()
-        self.root.title('微信分身 Studio · 1.0.0')
+        self.root.title('微信分身 Studio · 1.0.1')
         self.root.geometry('1180x850'); self.root.minsize(1040,760)
         shell=ttk.Frame(self.root); shell.pack(fill='both',expand=True)
         rail=tk.Frame(shell,bg='#152538',width=205); rail.pack(side='left',fill='y'); rail.pack_propagate(False)
@@ -70,12 +70,18 @@ class StudioUI:
         widget.configure(state='normal'); widget.delete('1.0','end'); widget.insert('1.0',text); widget.configure(state='disabled')
 
     def run(self,work,done=None):
+        self.jobs+=1
         def thread():
             try:
                 value=work()
-                if done:self.app.events.put(('ui',lambda v=value:done(v)))
+                def finish(v=value):
+                    try:
+                        if done:done(v)
+                    finally:self.jobs-=1
+                self.app.events.put(('ui',finish))
             except Exception as exc:
                 def fail(message=str(exc)):
+                    self.jobs-=1
                     self.app.status.set('操作未完成，请检查提示'); messagebox.showerror('操作未完成',message)
                 self.app.events.put(('ui',fail))
         threading.Thread(target=thread,daemon=True).start()
@@ -103,6 +109,9 @@ class StudioUI:
         ttk.Button(row,text='＋ 导入文件',style='Accent.TButton',command=self.import_files).pack(side='left',padx=(0,8))
         ttk.Button(row,text='导入 HTML 备份文件夹',command=self.import_folder).pack(side='left',padx=4)
         ttk.Button(row,text='导出完整会话',command=self.export_contact).pack(side='right')
+        row=ttk.Frame(page); row.pack(fill='x',pady=(8,0))
+        ttk.Button(row,text='完整备份（记录＋记忆＋设置）',command=self.backup_all).pack(side='left')
+        ttk.Button(row,text='恢复完整备份',command=self.restore_all).pack(side='left',padx=8)
         row=ttk.Frame(page); row.pack(fill='x',pady=14)
         self.contact_choice=ttk.Combobox(row,state='readonly'); self.contact_choice.pack(side='left',fill='x',expand=True)
         self.contact_choice.bind('<<ComboboxSelected>>',lambda e:self.reset_records())
@@ -238,6 +247,43 @@ class StudioUI:
         if not path:return
         self.run(lambda:export_file(path,all_rows(self.store,contact)),lambda count:self.app.status.set(f'已导出 {count} 条消息到所选位置'))
 
+    def backup_all(self):
+        from backup import create_backup
+        path=filedialog.asksaveasfilename(title='完整备份：消息、记忆、风格设置、近期上下文和模型配置',defaultextension='.zip',filetypes=[('Studio完整备份','*.zip')])
+        if not path:return
+        config=self.app.snapshot()
+        self.run(lambda:create_backup(self.store,config,path),lambda counts:messagebox.showinfo('备份完成',f"消息 {counts['messages']} 条、联系人记忆 {counts['memories']} 条、近期对话 {counts['exchanges']} 组。\n已包含风格设置和模型配置，不保存API Key。\n这是个人数据备份，请自行保管。"))
+
+    def restore_all(self):
+        from backup import restore_backup
+        if self.app.running or self.jobs or getattr(self.app,'testing_connection',False):
+            return messagebox.showinfo('请先停止任务','请停止微信监听，并等待导入、生成或模型测试完成后再恢复。')
+        path=filedialog.askopenfilename(title='选择Studio完整备份ZIP（不是聊天导出文件）',filetypes=[('Studio完整备份','*.zip')])
+        if not path:return
+        if not messagebox.askyesno('恢复完整备份','恢复会替换当前记录、记忆和设置。程序会先校验备份，再自动保存一份当前数据。继续恢复吗？'):return
+        config=self.app.snapshot()
+        busy=tk.Toplevel(self.root); busy.title('恢复完整备份'); busy.transient(self.root); busy.grab_set(); busy.protocol('WM_DELETE_WINDOW',lambda:None)
+        ttk.Label(busy,text='正在校验并恢复，请稍候…',padding=30).pack()
+        def work():
+            try:return True,restore_backup(self.store,config,path,self.root_path/'config.json')
+            except Exception as exc:return False,str(exc)
+        def done(result):
+            busy.destroy()
+            if not result[0]:return messagebox.showerror('未能恢复',result[1])
+            from app import DEFAULT
+            restored,counts,safety=result[1]
+            self.app.cfg=dict(DEFAULT,**restored)
+            for name,var in self.app.vars.items():var.set(str(self.app.cfg.get(name,'')))
+            self.provider_choice.set({'ollama':'本机 Ollama','lmstudio':'本机 LM Studio'}.get(restored.get('provider'),'小米 MiMo'))
+            self.key_entry.configure(state='disabled' if restored.get('provider') in ('ollama','lmstudio') else 'normal')
+            self.app.key.set(''); self.app.auto.set(False)
+            self.app.prompt.delete('1.0','end'); self.app.prompt.insert('1.0',self.app.cfg['prompt'])
+            for key,var,default in [('learn',self.learn,True),('longer',self.longer,True),('proactive',self.proactive,True),('binding',self.binding,'自动按聊天标题匹配')]:var.set(self.store.get(key,default))
+            self.contact_choice.set(''); self.lab_contact.set(''); self.memory_contact.set(''); self.analysis_contact.set(''); self.stats_contact.set('')
+            self.record_offset=0; self.search_var.set(''); self.refresh()
+            messagebox.showinfo('恢复完成',f"已恢复 {counts['messages']} 条消息和 {counts['memories']} 条记忆。\n恢复前备份：{safety}\nAPI Key需要重新填写，自动发送保持关闭。")
+        self.run(work,done)
+
     def persona(self):
         page=self.pages['我的分身']; self.heading(page,'我的分身','从已确认的本人消息中提取风格；这是风格示例与记忆增强，不是修改模型参数。')
         for label,var in [('使用我的聊天风格',self.learn),('回应更充分：接住话题，通常2至5句',self.longer),('更主动接话：自然追问，不机械反问',self.proactive)]:ttk.Checkbutton(page,text=label,variable=var,command=self.save_persona).pack(anchor='w',pady=6)
@@ -280,6 +326,8 @@ class StudioUI:
         row=ttk.Frame(page); row.pack(fill='x',pady=12)
         self.lab_button=ttk.Button(row,text='生成我的风格回复',style='Accent.TButton',command=self.lab_reply); self.lab_button.pack(side='left')
         ttk.Button(row,text='查看本次使用的提示与记忆',command=self.inspect_prompt).pack(side='left',padx=8)
+        self.lab_progress=tk.StringVar(value='本地模型会根据上下文预算选择参考资料和最近对话。')
+        ttk.Label(page,textvariable=self.lab_progress,style='Hint.TLabel',wraplength=850).pack(anchor='w')
         self.lab_output=self.text(page,12)
 
     def analysis_page(self):
@@ -395,27 +443,47 @@ class StudioUI:
 
     def reply_cfg(self,cfg,contact,query):
         copy=dict(cfg)
-        if cfg.get('persona_enabled',True):copy['prompt']=self.store.prompt(contact,query,cfg['prompt'],cfg.get('longer',True),cfg.get('proactive',True))
+        budget=None
+        if cfg.get('provider') in ('ollama','lmstudio'):
+            from app import local_budget
+            budget=min(1800,local_budget(cfg)-len(query.encode('utf-8'))-48)
+            if budget<600:raise ValueError('当前消息过长，请缩短或提高本地上下文长度。')
+        if cfg.get('persona_enabled',True):copy['prompt']=self.store.prompt(contact,query,cfg['prompt'],cfg.get('longer',True),cfg.get('proactive',True),max_bytes=budget)
         else:copy['prompt']=cfg['prompt']+('\n适当充分回应，可以自然接话追问。' if cfg.get('proactive',True) else '')
         return copy
 
     def inspect_prompt(self):
-        cfg=self.reply_cfg(self.app.snapshot(),self.lab_contact.get(),self.lab_input.get('1.0','end').strip())
+        from app import prepare_messages
+        try:
+            query=self.lab_input.get('1.0','end').strip(); contact=self.lab_contact.get()
+            cfg=self.reply_cfg(self.app.snapshot(),contact,query)
+            actual=prepare_messages(cfg,query,self.store.recent(contact))
+        except ValueError as exc:return messagebox.showerror('提示预览',str(exc))
         dialog=tk.Toplevel(self.root); dialog.title('本次提交给模型的提示预览'); dialog.geometry('800x650')
-        self.set_text(self.text(dialog,22),cfg['prompt'])
+        self.set_text(self.text(dialog,22),json.dumps(actual,ensure_ascii=False,indent=2))
 
     def lab_reply(self):
         from app import completion,validate_connection
         query=self.lab_input.get('1.0','end').strip(); contact=self.lab_contact.get()
         if not query:return
-        cfg=self.reply_cfg(self.app.snapshot(),contact,query)
-        try:key,_=validate_connection(cfg,self.app.key.get())
+        try:
+            cfg=self.reply_cfg(self.app.snapshot(),contact,query)
+            key,_=validate_connection(cfg,self.app.key.get())
         except ValueError as exc:return messagebox.showerror('模型配置',str(exc))
         self.lab_button.configure(state='disabled'); self.set_text(self.lab_output,'正在生成，不会发送到微信…')
+        import time
+        started=time.monotonic(); self.lab_started=started
+        def waiting():
+            if self.lab_started==started and str(self.lab_button['state'])=='disabled':
+                self.lab_progress.set(f'等待模型 {int(time.monotonic()-started)} 秒；本地首次加载可能较慢。')
+                self.root.after(1000,waiting)
+        waiting()
         def work():
             try:return completion(cfg,key,query,self.store.recent(contact))
             except Exception as exc:return '生成失败：'+str(exc)
-        def done(answer):self.set_text(self.lab_output,answer); self.lab_button.configure(state='normal')
+        def done(answer):
+            self.lab_started=None
+            self.set_text(self.lab_output,answer); self.lab_button.configure(state='normal'); self.lab_progress.set('生成结束；失败原因会显示在下方。' if answer.startswith('生成失败：') else '已生成，未发送微信。')
         self.run(work,done)
 
     def automation(self):
@@ -455,6 +523,9 @@ class StudioUI:
             if name=='model':self.model_choice=ttk.Combobox(page,textvariable=app.vars[name]); self.model_choice.pack(fill='x')
             else:ttk.Entry(page,textvariable=app.vars[name]).pack(fill='x')
         ttk.Button(page,text='读取本地模型列表',command=self.load_ollama_models).pack(anchor='w',pady=5)
+        ttk.Label(page,text='本地上下文长度（与模型服务加载设置一致；默认4096，保守控制输入）').pack(anchor='w',pady=(8,4))
+        app.vars['context_size']=tk.StringVar(value=str(app.cfg.get('context_size',4096)))
+        ttk.Combobox(page,textvariable=app.vars['context_size'],values=['2048','4096','8192','16384','32768'],state='readonly').pack(fill='x')
         ttk.Label(page,text='API Key（仅本次运行保存，不写入磁盘）').pack(anchor='w',pady=(12,4))
         app.key=tk.StringVar(value=os.environ.get('MIMO_API_KEY','')); self.key_entry=ttk.Entry(page,textvariable=app.key,show='•'); self.key_entry.pack(fill='x')
         if app.vars['provider'].get() in ('ollama','lmstudio'):self.key_entry.configure(state='disabled')
