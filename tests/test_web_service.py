@@ -40,7 +40,7 @@ class WebTests(unittest.TestCase):
         self.assertTrue(self.state.cfg()['local_auth'])
         self.request('/api/config',{'provider':'mimo'})
         self.assertFalse(self.state.key)
-        self.assertNotIn('fake-local-token',(Path(self.tmp.name)/'config.json').read_text())
+        self.assertNotIn('fake-local-token',(Path(self.tmp.name)/'config.json').read_text('utf-8'))
 
     def test_auth_origin_and_methods(self):
         with self.assertRaises(urllib.error.HTTPError) as exc:self.request('/api/state',auth=False)
@@ -49,6 +49,31 @@ class WebTests(unittest.TestCase):
         self.assertEqual(exc.exception.code,403)
         with self.assertRaises(urllib.error.HTTPError):self.request('/api/config?provider=mimo')
         self.assertEqual(self.request('/api/state')['stats']['total'],0)
+
+    def test_preview_discard_failed_upload_and_expired_confirmation(self):
+        preview=self.request('/api/upload?name=test.json&preview=1',b'[{"content":"test","contact":"fixture"}]')
+        file=self.state.imports[preview['import_id']][0]
+        self.assertTrue(file.exists())
+        self.assertTrue(self.request('/api/import-discard',{'import_id':preview['import_id']})['discarded'])
+        self.assertFalse(file.exists())
+        self.assertFalse(self.request('/api/import-discard',{'import_id':preview['import_id']})['discarded'])
+        with self.assertRaises(urllib.error.HTTPError):self.request('/api/import-confirm',{'import_id':preview['import_id']})
+        with self.assertRaises(urllib.error.HTTPError):self.request('/api/upload?name=broken.json',b'invalid json')
+        self.assertFalse(list((Path(self.tmp.name)/'data'/'uploads').iterdir()))
+
+    def test_model_address_change_clears_token_and_invalid_limits_do_not_save(self):
+        self.request('/api/config',{'provider':'lmstudio','base_url':'http://localhost:1234/v1','key':'local-fixture'})
+        self.request('/api/config',{'base_url':'http://localhost:1235/v1'})
+        self.assertFalse(self.state.key)
+        for value in (0,8193,True,128.5):
+            with self.assertRaises(urllib.error.HTTPError):self.request('/api/config',{'max_tokens':value})
+        self.request('/api/config',{'max_tokens':1024,'reasoning':'none'})
+        self.assertEqual(self.request('/api/state')['config']['max_tokens'],1024)
+
+    def test_missing_media_folder_and_ocr_window_fail_clearly(self):
+        with self.assertRaises(urllib.error.HTTPError):self.request('/api/folder-media',{'path':str(Path(self.tmp.name)/'missing')})
+        with self.assertRaises(urllib.error.HTTPError) as result:self.request('/api/ocr-test',{})
+        self.assertIn('请先选择微信窗口',result.exception.read().decode())
 
     def test_import_field_mapping_media_identity_and_reimport_dedup(self):
         raw=json.dumps([{'内容列':'你好','姓名':'我','会话列':'甲','发送':1,'日期':'2026-10-15'},{'内容列':'<msg/>','姓名':'我','会话列':'甲','发送':1,'日期':'2026-10-15','Type':3}],ensure_ascii=False).encode()
@@ -64,6 +89,8 @@ class WebTests(unittest.TestCase):
         result=self.request('/api/upload?name=clip.mp4&mode=media',b'0123456789')
         status,headers,data=self.request('/api/asset/'+result['id'],headers={'Range':'bytes=3-5'},raw=True)
         self.assertEqual(status,206);self.assertEqual(data,b'345');self.assertEqual(headers['Content-Range'],'bytes 3-5/10')
+        status,headers,data=self.request('/api/asset/'+result['id'],headers={'Range':'bytes=-3'},raw=True)
+        self.assertEqual(status,206);self.assertEqual(data,b'789');self.assertEqual(headers['Content-Range'],'bytes 7-9/10')
         task=self.request('/api/backup',{})['job'];entry=self.wait(task)
         self.assertEqual(entry['state'],'success')
         status,headers,data=self.request(entry['result']['download'],raw=True)

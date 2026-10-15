@@ -4,11 +4,10 @@ Keys are validated against selected database salts and returned only in memory.
 No injection, memory writes, debug privilege changes, or credential logging.
 """
 import ctypes
-import hashlib
 import re
 import struct
 from ctypes import wintypes
-from localdb import verify_key
+from localdb import verify_key,derive_key
 
 
 def related_processes(pid):
@@ -23,19 +22,22 @@ def related_processes(pid):
             if entry.szExeFile.lower() in ('weixin.exe','wechat.exe'):rows.append((entry.th32ProcessID,entry.th32ParentProcessID))
             more=k.Process32NextW(handle,ctypes.byref(entry))
     finally:k.CloseHandle(handle)
-    selected={int(pid)}
-    changed=True
-    while changed:
-        changed=False
-        for child,parent in rows:
-            if parent in selected and child not in selected:selected.add(child);changed=True
-            if child in selected and parent in {r[0] for r in rows} and parent not in selected:selected.add(parent);changed=True
     # Some WeChat database workers are started independently rather than as children.
     # Candidates are still limited to WeChat-named processes and validated salts.
-    return sorted((selected|{child for child,parent in rows})-{0})
+    available={child for child,parent in rows}-{0}
+    if int(pid) and int(pid) not in available:return []
+    return sorted(available)
 
 
-def find_keys(pid,pages,progress=lambda text:None,cancelled=lambda:False):
+def find_keys(pid,pages,progress=lambda text:None,cancelled=lambda:False,version=4):
+    def check_cancelled():
+        if cancelled():raise ValueError('读取已停止；数据库密钥未写入磁盘')
+    check_cancelled()
+    if version not in (3,4):raise ValueError('仅支持SQLCipher 3/4加密配置')
+    pages=list(pages)
+    if any(not isinstance(page,bytes) or len(page)!=4096 for page in pages):raise ValueError('用于密钥校验的数据库首页不完整')
+    if not pages:return {}
+    if int(pid) not in related_processes(0):raise ValueError('请选择当前正在运行的微信进程')
     class Region(ctypes.Structure):
         _fields_=[('BaseAddress',ctypes.c_void_p),('AllocationBase',ctypes.c_void_p),('AllocationProtect',wintypes.DWORD),
                   ('PartitionId',wintypes.WORD),('RegionSize',ctypes.c_size_t),('State',wintypes.DWORD),('Protect',wintypes.DWORD),('Type',wintypes.DWORD)]
@@ -71,17 +73,19 @@ def find_keys(pid,pages,progress=lambda text:None,cancelled=lambda:False):
                 values=[m[1].decode().lower() for m in pattern.finditer(data)]
                 values.extend(m[0].replace(b'\x00',b'').decode().lower() for m in wide.finditer(data))
                 for value in values:
+                    check_cancelled()
                     if value in seen:continue
                     seen.add(value);key=bytes.fromhex(value[:64])
                     if len(set(key))<10:continue
                     candidates=[value[64:]] if len(value)==96 and value[64:] in expected else list(expected) if len(value)==64 else []
                     for salt in candidates:
+                        check_cancelled()
                         if salt in found:continue
                         page=expected[salt]
-                        if verify_key(page,key):found[salt]=key
+                        if verify_key(page,key,version):found[salt]=key
                         elif len(value)==96:
-                            derived=hashlib.pbkdf2_hmac('sha512',key,page[:16],256000,32)
-                            if verify_key(page,derived):found[salt]=derived
+                            derived=derive_key(key,page[:16],version)
+                            if verify_key(page,derived,version):found[salt]=derived
                     if len(value)==64 and len(fallback)<256:fallback.append(key)
                 if found.keys()>=expected.keys():return found
                 if total//(32*1024*1024)!=(total-read.value)//(32*1024*1024):progress(f'已检查 {total//(1024*1024)} MB 微信可读内存，匹配 {len(found)}/{len(expected)} 个数据库')
@@ -100,9 +104,11 @@ def find_keys(pid,pages,progress=lambda text:None,cancelled=lambda:False):
                     kernel.ReadProcessMemory(handle,ctypes.c_void_p(base+offset),buffer,count,ctypes.byref(read))
                     data=tail+buffer.raw[:read.value];tail=data[-512:];offset+=count
                     for match in reference_pattern.finditer(data):
+                        check_cancelled()
                         salt=references[match[0]]
                         if salt in found:continue
                         for position in range(max(0,match.start()-512)//8*8,min(len(data)-8,match.start()+520),8):
+                            check_cancelled()
                             pointer=struct.unpack_from('<Q',data,position)[0]
                             if not 0x10000<pointer<0x7fffffffffff:continue
                             candidate=ctypes.create_string_buffer(384);got=ctypes.c_size_t()
@@ -112,10 +118,11 @@ def find_keys(pid,pages,progress=lambda text:None,cancelled=lambda:False):
                                 if len(key)!=32 or len(set(key))<12 or (salt,key) in binary_seen:return
                                 binary_seen.add((salt,key))
                                 for variant in (key,b''.join(key[i:i+4][::-1] for i in range(0,32,4)),key[16:]+key[:16]):
-                                    if verify_key(expected[salt],variant):found[salt]=variant;return
+                                    if verify_key(expected[salt],variant,version):found[salt]=variant;return
                                 if len(binary_candidates)<96:binary_candidates.append((salt,key))
                             for key_offset in range(0,len(block)-31,8):check(block[key_offset:key_offset+32])
                             for key_offset in range(0,len(block)-7,8):
+                                check_cancelled()
                                 second=struct.unpack_from('<Q',block,key_offset)[0]
                                 if not 0x10000<second<0x7fffffffffff:continue
                                 raw=ctypes.create_string_buffer(32);got_key=ctypes.c_size_t()
@@ -124,18 +131,19 @@ def find_keys(pid,pages,progress=lambda text:None,cancelled=lambda:False):
                             if salt in found:break
                     if found.keys()>=expected.keys():return found
             for index,(salt,key) in enumerate(binary_candidates):
-                if cancelled():break
+                check_cancelled()
                 if salt in found:continue
                 if index%10==0:progress(f'校验SQLCipher候选缓冲区 {index+1}/{len(binary_candidates)}')
-                derived=hashlib.pbkdf2_hmac('sha512',key,expected[salt][:16],256000,32)
-                if verify_key(expected[salt],derived):found[salt]=derived
+                derived=derive_key(key,expected[salt][:16],version)
+                if verify_key(expected[salt],derived,version):found[salt]=derived
         for index,key in enumerate(fallback):
-            if cancelled():break
+            check_cancelled()
             if index%10==0:progress(f'校验候选密钥 {index+1}/{len(fallback)}，匹配 {len(found)}/{len(expected)} 个数据库')
             for salt,page in expected.items():
+                check_cancelled()
                 if salt in found:continue
-                derived=hashlib.pbkdf2_hmac('sha512',key,page[:16],256000,32)
-                if verify_key(page,derived):found[salt]=derived
+                derived=derive_key(key,page[:16],version)
+                if verify_key(page,derived,version):found[salt]=derived
             if found.keys()>=expected.keys():break
-        return found
+        check_cancelled();return found
     finally:kernel.CloseHandle(handle)

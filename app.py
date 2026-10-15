@@ -24,7 +24,7 @@ _ocr_lock=threading.Lock()
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 DEFAULT = dict(provider='mimo',base_url='https://api.xiaomimimo.com/v1', model='mimo-v2.6-pro',
                prompt='自然接住对方的话题，不编造经历或承诺。只输出要发送的正文。',
-               title='', auto=False, interval=3,context_size=4096)
+               title='', auto=False, interval=3,context_size=4096,max_tokens=768,reasoning='none')
 
 def local_budget(cfg):
     try:size=int(cfg.get('context_size',4096)); output=int(cfg.get('max_tokens',768))
@@ -80,6 +80,7 @@ def completion(cfg, key, text, history):
     local=cfg.get('provider','mimo') in ('ollama','lmstudio')
     payload = dict(model=cfg['model'].strip(), messages=prepare_messages(cfg,text,history), stream=False)
     payload['max_tokens' if local else 'max_completion_tokens']=int(cfg.get('max_tokens',768 if local else 2048))
+    if local and cfg.get('reasoning')=='none':payload['reasoning_effort']='none'
     headers={'Content-Type':'application/json; charset=utf-8'}
     if local and key:headers['Authorization']='Bearer '+key
     if not local:headers.update({'api-key':key,'Authorization':'Bearer '+key})
@@ -89,6 +90,7 @@ def completion(cfg, key, text, history):
         with open_request(req, timeout=300 if local else 90) as response:
             result = json.load(response)
     except urllib.error.HTTPError as exc:
+        if local and exc.code==401:raise RuntimeError('本地模型服务 HTTP 401：服务器要求 API Token。请核对 LM Studio 的认证设置；Token只需在本次运行填写。') from None
         detail=''
         try:
             error=json.loads(exc.read(8192)); error=error.get('error',error)
@@ -105,7 +107,7 @@ def completion(cfg, key, text, history):
     try:choice=result['choices'][0]; message=choice['message']; answer=message.get('content')
     except (KeyError,TypeError,IndexError,AttributeError):raise ValueError('模型返回格式不正确，缺少choices/message；请检查模型服务兼容接口') from None
     if choice.get('finish_reason')=='length':raise ValueError('模型达到输出上限，结果已截断，未作为回复使用。请关闭思考模式、简化要求后重试。')
-    if choice.get('finish_reason') in ('content_filter','tool_calls'):raise ValueError('模型未正常完成纯文本回复（过滤或工具调用），未发送微信')
+    if choice.get('finish_reason') not in (None,'stop') or message.get('tool_calls'):raise ValueError('模型未正常完成纯文本回复（过滤或工具调用），未发送微信')
     if local and isinstance(answer,str):
         answer=re.sub(r'<think>.*?</think>','',answer,flags=re.S).strip()
         if '</think>' in answer:answer=answer.rsplit('</think>',1)[-1].strip()

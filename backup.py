@@ -9,7 +9,7 @@ import tempfile
 import zipfile
 from contextlib import closing
 
-CONFIG_KEYS = {'provider','base_url','model','prompt','title','interval','context_size'}
+CONFIG_KEYS = {'provider','base_url','model','prompt','title','interval','context_size','max_tokens','reasoning'}
 TABLES = {'messages': {'id','contact','sender','role','ts','content','source','digest'},
           'settings': {'key','value'}, 'memories': {'id','contact','content','created'},
           'exchanges': {'id','contact','user','answer','created'}}
@@ -20,6 +20,11 @@ def clean_config(config):
     result = {k:v for k,v in config.items() if k in CONFIG_KEYS}
     if any(not isinstance(v,(str,int,float)) or isinstance(v,bool) for v in result.values()):
         raise ValueError('备份中的模型配置格式不正确')
+    for field,minimum,maximum in (('context_size',2048,131072),('max_tokens',128,8192)):
+        if field in result:
+            value=result[field]
+            if not isinstance(value,int) or not minimum<=value<=maximum:raise ValueError('模型配置范围不正确：'+field)
+    if result.get('reasoning','default') not in ('default','none'):raise ValueError('思考模式配置不正确')
     result['auto'] = False
     return result
 
