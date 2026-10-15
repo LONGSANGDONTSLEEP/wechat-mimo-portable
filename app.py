@@ -24,7 +24,29 @@ _ocr_lock=threading.Lock()
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 DEFAULT = dict(provider='mimo',base_url='https://api.xiaomimimo.com/v1', model='mimo-v2.6-pro',
                prompt='自然接住对方的话题，不编造经历或承诺。只输出要发送的正文。',
-               title='', auto=False, interval=3)
+               title='', auto=False, interval=3,context_size=4096)
+
+def local_budget(cfg):
+    try:size=int(cfg.get('context_size',4096)); output=int(cfg.get('max_tokens',768))
+    except (ValueError,TypeError):raise ValueError('本地上下文长度必须为整数') from None
+    if not 2048<=size<=131072 or not 1<=output<size-384:raise ValueError('请检查本地上下文长度和回复长度设置')
+    # UTF-8 byte count is deliberately conservative, not an exact tokenizer count.
+    return size-output-384
+
+def prepare_messages(cfg,text,history):
+    base=[{'role':'system','content':cfg['prompt']}]
+    current={'role':'user','content':text}
+    if cfg.get('provider') not in ('ollama','lmstudio'):return base+history[-12:]+[current]
+    budget=local_budget(cfg)
+    used=sum(len(m['content'].encode('utf-8'))+24 for m in base+[current])
+    if used>budget:raise ValueError('当前消息或补充提示超出本地上下文预算。请缩短内容，或在模型服务加载更大上下文后同步修改“本地上下文长度”。')
+    retained=[]
+    pairs=[history[i:i+2] for i in range(0,len(history),2)]
+    for pair in reversed(pairs[-6:]):
+        cost=sum(len(m['content'].encode('utf-8'))+24 for m in pair)
+        if used+cost>budget:break
+        retained=pair+retained; used+=cost
+    return base+retained+[current]
 
 def fingerprint(text):
     return hashlib.sha256(''.join(text.split()).encode()).hexdigest()
@@ -56,8 +78,8 @@ def validate_connection(cfg,key):
 def completion(cfg, key, text, history):
     key,url=validate_connection(cfg,key)
     local=cfg.get('provider','mimo') in ('ollama','lmstudio')
-    payload = dict(model=cfg['model'], messages=[{'role':'system','content':cfg['prompt']}]+history[-12:]+[{'role':'user','content':text}], stream=False)
-    payload['max_tokens' if local else 'max_completion_tokens']=int(cfg.get('max_tokens',2048))
+    payload = dict(model=cfg['model'].strip(), messages=prepare_messages(cfg,text,history), stream=False)
+    payload['max_tokens' if local else 'max_completion_tokens']=int(cfg.get('max_tokens',768 if local else 2048))
     headers={'Content-Type':'application/json; charset=utf-8'}
     if not local:headers.update({'api-key':key,'Authorization':'Bearer '+key})
     req = urllib.request.Request(url, json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers)
@@ -66,17 +88,29 @@ def completion(cfg, key, text, history):
         with open_request(req, timeout=300 if local else 90) as response:
             result = json.load(response)
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f'本地模型服务 HTTP {exc.code}，请检查服务地址与本地模型名称' if local else f'MiMo HTTP {exc.code}，请检查 Key、地址、额度和模型') from None
+        detail=''
+        try:
+            error=json.loads(exc.read(8192)); error=error.get('error',error)
+            detail=str(error.get('message',error) if isinstance(error,dict) else error)[:350]
+        except Exception:pass
+        from chatdata import redact
+        raise RuntimeError((f'本地模型服务 HTTP {exc.code}' if local else f'MiMo HTTP {exc.code}')+'：'+(redact(detail) or '请检查服务地址、模型名称与认证配置')) from None
     except UnicodeEncodeError:
         raise ValueError('请求头含非英文字符，尚未成功调用 MiMo。请重新复制 Key；若仍失败，请检查系统代理配置。') from None
     except urllib.error.URLError:
         raise RuntimeError('无法连接本地模型服务，请先启动服务并检查端口（Ollama 11434 / LM Studio 1234）' if local else '无法连接 MiMo，请检查网络、代理和接口地址') from None
-    answer = result['choices'][0]['message']['content']
+    except TimeoutError:raise RuntimeError('模型请求超时；请检查模型是否加载、关闭思考模式，或减少上下文后重试') from None
+    except (json.JSONDecodeError,UnicodeDecodeError):raise ValueError('服务返回的不是有效JSON，请检查服务地址是否为模型API地址') from None
+    try:choice=result['choices'][0]; message=choice['message']; answer=message.get('content')
+    except (KeyError,TypeError,IndexError,AttributeError):raise ValueError('模型返回格式不正确，缺少choices/message；请检查模型服务兼容接口') from None
+    if choice.get('finish_reason')=='length':raise ValueError('模型达到输出上限，结果已截断，未作为回复使用。请关闭思考模式、简化要求后重试。')
+    if choice.get('finish_reason') in ('content_filter','tool_calls'):raise ValueError('模型未正常完成纯文本回复（过滤或工具调用），未发送微信')
     if local and isinstance(answer,str):
         answer=re.sub(r'<think>.*?</think>','',answer,flags=re.S).strip()
+        if '</think>' in answer:answer=answer.rsplit('</think>',1)[-1].strip()
         if '<think>' in answer:raise ValueError('本地模型只返回了未结束的思考内容，请换用聊天模型或检查模型配置')
     if not isinstance(answer, str) or not answer.strip():
-        raise ValueError('模型未返回回复正文')
+        raise ValueError('模型只返回思考内容，没有回复正文；请在本地模型设置关闭思考模式后重试' if message.get('reasoning_content') or message.get('reasoning') else '模型未返回回复正文')
     if len(answer) > 1500:
         raise ValueError('回复超过1500字，请缩短提示词要求')
     return answer.strip()
@@ -95,19 +129,19 @@ async def recognize_image(image):
 
 class App:
     def __init__(self, root,data_root=None):
-        self.root=root
-        root.title('微信分身 Studio · 1.0.0')
+        self.root=root; self.data_root=Path(data_root or ROOT)
+        root.title('微信分身 Studio · 1.0.1')
         root.geometry('800x780')
         self.cfg=DEFAULT.copy()
-        if (ROOT/'config.json').exists():
-            try: self.cfg.update(json.loads((ROOT/'config.json').read_text('utf-8')))
+        if (self.data_root/'config.json').exists():
+            try: self.cfg.update(json.loads((self.data_root/'config.json').read_text('utf-8')))
             except Exception: messagebox.showwarning('配置', '配置无法读取，使用默认值')
         if self.cfg['prompt']=='你是微信聊天助手。自然、简短地用中文回复对方，不编造事实。只输出要发送的正文。':self.cfg['prompt']=DEFAULT['prompt']
-        self.events=queue.Queue(); self.stop=threading.Event(); self.running=False
+        self.events=queue.Queue(); self.stop=threading.Event(); self.running=False; self.testing_connection=False
         self.history=[]; self.pending=None; self.seen=set(); self.vars={}; self.awaiting=threading.Event()
-        self.windows=[]; self.monitor=None; self.preview_dialog=None
+        self.windows=[]; self.monitor=None; self.preview_dialog=None; self.generating_since=None
         from studio_ui import StudioUI
-        self.studio=StudioUI(self,data_root or ROOT)
+        self.studio=StudioUI(self,self.data_root)
         root.bind('<Escape>',lambda _:self.halt()); root.protocol('WM_DELETE_WINDOW',self.close)
         root.after(200,self.pump)
         self.refresh_windows()
@@ -195,7 +229,7 @@ class App:
 
     def save(self):
         self.cfg=self.snapshot(); self.cfg['auto']=False
-        (ROOT/'config.json').write_text(json.dumps(self.cfg,ensure_ascii=False,indent=2),'utf-8')
+        (self.data_root/'config.json').write_text(json.dumps(self.cfg,ensure_ascii=False,indent=2),'utf-8')
         self.status.set('已保存配置；API Key 不保存')
 
     def start(self):
@@ -213,17 +247,17 @@ class App:
 
     def test_connection(self):
         if self.running:return messagebox.showinfo('测试连接','请先停止监听')
-        cfg=self.snapshot()
+        if self.testing_connection:return
+        cfg=dict(self.snapshot(),prompt='你是模型连接测试助手，只输出OK。',max_tokens=128)
         try:key,_=validate_connection(cfg,self.key.get())
         except ValueError as exc:return messagebox.showerror('模型配置需要修正',str(exc))
         provider={'ollama':'Ollama','lmstudio':'LM Studio'}.get(cfg.get('provider'),'MiMo')
-        self.status.set('正在测试 '+provider+' 连接，不操作微信')
+        self.testing_connection=True; self.status.set('正在测试 '+provider+' 连接，不操作微信')
         def test():
             try:
                 completion(cfg,key,'请只回复OK',[])
-                self.events.put(('log',provider+' 连接成功：模型已返回正文（未发送微信）'))
-            except Exception as exc:self.events.put(('log',provider+' 连接测试失败：'+str(exc)))
-            finally:self.events.put(('connection_done',None))
+                self.events.put(('connection_done',(True,provider+' 连接成功：模型已返回正文（未发送微信）')))
+            except Exception as exc:self.events.put(('connection_done',(False,provider+' 连接测试失败：'+str(exc))))
         threading.Thread(target=test,daemon=True).start()
 
     def halted(self):
@@ -292,7 +326,10 @@ class App:
                     self.events.put(('log','已排除与本程序历史回复相同的文字')); continue
                 self.events.put(('log','['+view.title+'] 识别：'+text))
                 reply_cfg=self.studio.reply_cfg(cfg,record_contact,text)
-                answer=completion(reply_cfg,key,text,self.history)
+                self.events.put(('model_wait',time.monotonic()))
+                self.events.put(('log','正在请求模型生成回复；本地模式会按上下文预算选择参考资料。'))
+                try:answer=completion(reply_cfg,key,text,self.history)
+                finally:self.events.put(('model_wait',None))
                 if self.halted():break
                 if not cfg['auto']:self.awaiting.set()
                 self.events.put(('preview',(view,text,answer)))
@@ -355,13 +392,20 @@ class App:
         if self.running:self.halted()
         while not self.events.empty():
             kind,value=self.events.get()
-            if kind=='ui':value()
+            if kind=='ui':
+                try:value()
+                except Exception as exc:self.status.set('界面操作失败：'+str(exc)); self.log('界面操作失败：'+str(exc))
             elif kind=='log':self.log(value)
+            elif kind=='model_wait':self.generating_since=value
             elif kind=='preview':
                 self.pending=value; self.log('回复预览：'+value[2])
             elif kind=='sent':self.pending=None; self.log('已发送')
-            elif kind=='connection_done':self.status.set('模型连接测试结束，详情见微信自动回复页日志')
+            elif kind=='connection_done':
+                self.testing_connection=False; self.status.set(value[1]); self.log(value[1])
+                (messagebox.showinfo if value[0] else messagebox.showerror)('模型连接测试',value[1])
             elif kind=='done':self.running=False; self.start_button.configure(state='normal'); self.window_choice.configure(state='readonly'); self.status.set('已停止')
+        if self.running and self.generating_since is not None:
+            self.status.set(f'模型生成中，已等待 {int(time.monotonic()-self.generating_since)} 秒；停止后会丢弃本次结果。')
         self.root.after(200,self.pump)
 
     def close(self):
@@ -375,7 +419,7 @@ if __name__=='__main__':
         if '--box' in sys.argv:
             x,y,w,h=map(int,sys.argv[sys.argv.index('--box')+1].split(',')); image=image.crop((x,y,x+w,y+h))
         view=asyncio.run(recognition.analyze(image,0,(0,0,image.width,image.height),recognize_image))
-        report={'version':'1.0.0','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
+        report={'version':'1.0.1','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
         (ROOT/'ocr-check.json').write_text(json.dumps(report,ensure_ascii=True,indent=2),'utf-8')
         sys.exit(0)
     if '--self-test' in sys.argv:
@@ -389,6 +433,32 @@ if __name__=='__main__':
         fixture=[{'talkerName':'演示联系人','senderName':'我','isSelf':True,'content':text,'type':1,'createTime':str(index)} for index,text in enumerate(('行啊，等下聊','哈哈，确实有点意思','你先说说怎么想的'))]
         fixture.append({'talkerName':'演示联系人','senderName':'朋友','isSelf':False,'content':'周末有什么安排','type':1,'createTime':'4'})
         instance.studio.store.import_rows(normalize_rows(fixture),'self-test'); instance.studio.refresh(); window.update()
+        from backup import create_backup,restore_backup
+        instance.studio.store.add_memory('演示联系人','演示记忆：周末骑车')
+        instance.studio.store.set('learn',True)
+        instance.studio.store.remember_exchange('演示联系人','演示问候','演示回复')
+        test_backup=Path(temporary.name)/'self-test-backup.zip'
+        counts=create_backup(instance.studio.store,DEFAULT,test_backup)
+        instance.studio.store.add_memory('演示联系人','恢复后应消失的演示记忆')
+        restored,restored_counts,safety=restore_backup(instance.studio.store,DEFAULT,test_backup,Path(temporary.name)/'config.json')
+        assert counts==restored_counts and len(instance.studio.store.memory('演示联系人'))==1
+        assert len(instance.studio.store.recent('演示联系人'))==2 and safety.is_file()
+        # Exercise real Tk callbacks and worker/UI queue with simulated model outcomes.
+        from unittest.mock import patch
+        instance.vars['provider'].set('lmstudio'); instance.vars['base_url'].set('http://127.0.0.1:1234/v1'); instance.vars['model'].set('self-test-model')
+        instance.studio.lab_input.insert('1.0','你好，周末有什么安排？')
+        def finish_ui_job():
+            deadline=time.monotonic()+5
+            while instance.studio.jobs and time.monotonic()<deadline:window.update(); time.sleep(.05)
+            assert instance.studio.jobs==0, 'UI worker did not finish'
+        with patch('app.completion',side_effect=ValueError('模型输出截断（演示错误）')):
+            instance.studio.lab_reply(); finish_ui_job()
+            assert '生成失败：' in instance.studio.lab_output.get('1.0','end')
+            assert str(instance.studio.lab_button['state'])=='normal'
+        with patch('app.completion',return_value='演示回复：周末可以聊聊骑车安排。'):
+            instance.studio.lab_reply(); finish_ui_job()
+            assert '演示回复：' in instance.studio.lab_output.get('1.0','end')
+            assert str(instance.studio.lab_button['state'])=='normal'
         user=ctypes.windll.user32
         user.GetAncestor.argtypes=[ctypes.c_void_p,ctypes.c_uint]; user.GetAncestor.restype=ctypes.c_void_p
         hwnd=user.GetAncestor(window.winfo_id(),2)
@@ -405,6 +475,6 @@ if __name__=='__main__':
         ImageDraw.Draw(sample).text((10,10),'你好 微信 测试',font=ImageFont.truetype('msyh.ttc',32),fill='black')
         result=asyncio.run(recognize_image(sample))
         assert '你好' in ''.join(result.text.split()), repr(result.text)
-        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 1.0.0: Studio pages + isolated demo corpus + locked HWND capture + bundled RapidOCR model','utf-8')
+        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 1.0.1: Studio pages + complete backup/restore + real Tk lab success/failure callbacks (simulated model) + isolated demo corpus + locked HWND capture + bundled RapidOCR model','utf-8')
         sys.exit(0)
     App(tk.Tk()).root.mainloop()
