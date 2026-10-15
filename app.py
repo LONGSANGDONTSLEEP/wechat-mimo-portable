@@ -71,7 +71,7 @@ def validate_connection(cfg,key):
     if not cfg['model'].strip() or not cfg['model'].isascii():raise ValueError('请选择本地服务中的准确模型 ID' if local else '模型名称应为英文模型 ID，例如 mimo-v2.6-pro')
     if local:
         if parsed.path.rstrip('/') in ('','/api'):base=urllib.parse.urlunsplit((parsed.scheme,parsed.netloc,'/v1','',''))
-        return '',base+'/chat/completions'
+        return normalize_api_key(key) if cfg.get('local_auth') and key.strip() else '',base+'/chat/completions'
     key=normalize_api_key(key)
     return key,base+'/chat/completions'
 
@@ -81,6 +81,7 @@ def completion(cfg, key, text, history):
     payload = dict(model=cfg['model'].strip(), messages=prepare_messages(cfg,text,history), stream=False)
     payload['max_tokens' if local else 'max_completion_tokens']=int(cfg.get('max_tokens',768 if local else 2048))
     headers={'Content-Type':'application/json; charset=utf-8'}
+    if local and key:headers['Authorization']='Bearer '+key
     if not local:headers.update({'api-key':key,'Authorization':'Bearer '+key})
     req = urllib.request.Request(url, json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers)
     try:
