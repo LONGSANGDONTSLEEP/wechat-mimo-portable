@@ -147,6 +147,7 @@ class ChatStore:
         with self.db() as db:
             for row in rows:
                 identity=[row['contact'],row['sender'],row['time'],row['text']]
+                if row.get('source_identity'):identity.append(row['source_identity'])
                 if not row['time']:identity.extend([str(source),row.get('row',0)])
                 digest=hashlib.sha256(json.dumps(identity,ensure_ascii=False).encode()).hexdigest()
                 cursor=db.execute('INSERT OR IGNORE INTO messages(contact,sender,role,ts,content,source,digest) VALUES(?,?,?,?,?,?,?)',

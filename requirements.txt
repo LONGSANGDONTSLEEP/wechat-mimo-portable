@@ -4,3 +4,5 @@ pyautogui==0.9.54
 pyperclip==1.11.0
 rapidocr_onnxruntime==1.2.3
 onnxruntime==1.31.0
+pycryptodome==4.0.0
+zstandard==0.25.0

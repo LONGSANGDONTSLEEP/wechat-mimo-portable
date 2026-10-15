@@ -30,6 +30,20 @@ class OllamaTests(unittest.TestCase):
             self.assertNotIn('max_completion_tokens',captured['body'])
         finally:server.shutdown();server.server_close();thread.join()
 
+    def test_explicit_local_token_is_sent_only_when_enabled(self):
+        import io
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        requests=[]
+        def respond(request,**kwargs):
+            requests.append(request)
+            return io.BytesIO(b'{"choices":[{"message":{"content":"OK"}}]}')
+        cfg=dict(app.DEFAULT,provider='lmstudio',base_url='http://127.0.0.1:1234/v1',model='test',local_auth=True)
+        with patch('urllib.request.build_opener',return_value=SimpleNamespace(open=respond)):
+            self.assertEqual(app.completion(cfg,'Bearer local-test-token','test',[]),'OK')
+        self.assertEqual(requests[0].get_header('Authorization'),'Bearer local-test-token')
+        self.assertIsNone(requests[0].get_header('Api-key'))
+
     def test_ollama_base_without_v1_and_empty_key(self):
         for base in ('http://localhost:11434','http://localhost:11434/api'):
             cfg=dict(app.DEFAULT,provider='ollama',base_url=base,model='local-test:8b')
