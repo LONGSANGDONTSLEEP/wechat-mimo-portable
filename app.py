@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import sys
 import threading
 import time
@@ -21,7 +22,7 @@ _ocr_engine=None
 _ocr_lock=threading.Lock()
 
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
-DEFAULT = dict(base_url='https://api.xiaomimimo.com/v1', model='mimo-v2.6-pro',
+DEFAULT = dict(provider='mimo',base_url='https://api.xiaomimimo.com/v1', model='mimo-v2.6-pro',
                prompt='自然接住对方的话题，不编造经历或承诺。只输出要发送的正文。',
                title='', auto=False, interval=3)
 
@@ -38,30 +39,42 @@ def normalize_api_key(value):
     return key
 
 def validate_connection(cfg,key):
-    key=normalize_api_key(key)
     base=cfg['base_url'].strip().rstrip('/')
     parsed=urllib.parse.urlsplit(base)
-    if not base.isascii() or parsed.scheme!='https' or not parsed.hostname:
+    local=cfg.get('provider','mimo') in ('ollama','lmstudio')
+    if not base.isascii() or parsed.scheme not in (('http','https') if local else ('https',)) or not parsed.hostname:
         raise ValueError('接口地址应为英文 HTTPS 地址，请点击按量付费或 Token Plan 按钮恢复')
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError('接口地址只能填写 Base URL，不能包含账号、密钥或查询参数')
-    if not cfg['model'].strip() or not cfg['model'].isascii():raise ValueError('模型名称应为英文模型 ID，例如 mimo-v2.6-pro')
+    if not cfg['model'].strip() or not cfg['model'].isascii():raise ValueError('请选择本地服务中的准确模型 ID' if local else '模型名称应为英文模型 ID，例如 mimo-v2.6-pro')
+    if local:
+        if parsed.path.rstrip('/') in ('','/api'):base=urllib.parse.urlunsplit((parsed.scheme,parsed.netloc,'/v1','',''))
+        return '',base+'/chat/completions'
+    key=normalize_api_key(key)
     return key,base+'/chat/completions'
 
 def completion(cfg, key, text, history):
     key,url=validate_connection(cfg,key)
-    payload = dict(model=cfg['model'], messages=[{'role':'system','content':cfg['prompt']}]+history[-12:]+[{'role':'user','content':text}], max_completion_tokens=2048, stream=False)
-    req = urllib.request.Request(url, json.dumps(payload,ensure_ascii=False).encode('utf-8'), {'Content-Type':'application/json; charset=utf-8','api-key':key,'Authorization':'Bearer '+key})
+    local=cfg.get('provider','mimo') in ('ollama','lmstudio')
+    payload = dict(model=cfg['model'], messages=[{'role':'system','content':cfg['prompt']}]+history[-12:]+[{'role':'user','content':text}], stream=False)
+    payload['max_tokens' if local else 'max_completion_tokens']=2048
+    headers={'Content-Type':'application/json; charset=utf-8'}
+    if not local:headers.update({'api-key':key,'Authorization':'Bearer '+key})
+    req = urllib.request.Request(url, json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers)
     try:
-        with urllib.request.urlopen(req, timeout=90) as response:
+        open_request=urllib.request.build_opener(urllib.request.ProxyHandler({})).open if local else urllib.request.urlopen
+        with open_request(req, timeout=300 if local else 90) as response:
             result = json.load(response)
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f'MiMo HTTP {exc.code}，请检查 Key、地址、额度和模型') from None
+        raise RuntimeError(f'本地模型服务 HTTP {exc.code}，请检查服务地址与本地模型名称' if local else f'MiMo HTTP {exc.code}，请检查 Key、地址、额度和模型') from None
     except UnicodeEncodeError:
         raise ValueError('请求头含非英文字符，尚未成功调用 MiMo。请重新复制 Key；若仍失败，请检查系统代理配置。') from None
     except urllib.error.URLError:
-        raise RuntimeError('无法连接 MiMo，请检查网络、代理和接口地址') from None
+        raise RuntimeError('无法连接本地模型服务，请先启动服务并检查端口（Ollama 11434 / LM Studio 1234）' if local else '无法连接 MiMo，请检查网络、代理和接口地址') from None
     answer = result['choices'][0]['message']['content']
+    if local and isinstance(answer,str):
+        answer=re.sub(r'<think>.*?</think>','',answer,flags=re.S).strip()
+        if '<think>' in answer:raise ValueError('本地模型只返回了未结束的思考内容，请换用聊天模型或检查模型配置')
     if not isinstance(answer, str) or not answer.strip():
         raise ValueError('模型未返回回复正文')
     if len(answer) > 1500:
@@ -83,7 +96,7 @@ async def recognize_image(image):
 class App:
     def __init__(self, root,data_root=None):
         self.root=root
-        root.title('微信分身 Studio · 0.5.0')
+        root.title('微信分身 Studio · 0.5.1')
         root.geometry('800x780')
         self.cfg=DEFAULT.copy()
         if (ROOT/'config.json').exists():
@@ -189,7 +202,7 @@ class App:
         if self.running:return
         cfg=self.snapshot(); key=self.key.get().strip()
         try:key,_=validate_connection(cfg,key)
-        except ValueError as exc:return messagebox.showerror('MiMo 配置需要修正',str(exc))
+        except ValueError as exc:return messagebox.showerror('模型配置需要修正',str(exc))
         if not self.monitor:return messagebox.showerror('尚未选择窗口','请在窗口列表选择微信窗口')
         if cfg['auto'] and not self.monitor['input']:
             return messagebox.showerror('确认发送位置','请先在窗口预览图上点击输入框位置')
@@ -202,13 +215,14 @@ class App:
         if self.running:return messagebox.showinfo('测试连接','请先停止监听')
         cfg=self.snapshot()
         try:key,_=validate_connection(cfg,self.key.get())
-        except ValueError as exc:return messagebox.showerror('MiMo 配置需要修正',str(exc))
-        self.status.set('正在测试 MiMo 连接，不操作微信')
+        except ValueError as exc:return messagebox.showerror('模型配置需要修正',str(exc))
+        provider={'ollama':'Ollama','lmstudio':'LM Studio'}.get(cfg.get('provider'),'MiMo')
+        self.status.set('正在测试 '+provider+' 连接，不操作微信')
         def test():
             try:
                 completion(cfg,key,'请只回复OK',[])
-                self.events.put(('log','MiMo 连接成功：鉴权通过，模型已返回正文（未发送微信）'))
-            except Exception as exc:self.events.put(('log','MiMo 连接测试失败：'+str(exc)))
+                self.events.put(('log',provider+' 连接成功：模型已返回正文（未发送微信）'))
+            except Exception as exc:self.events.put(('log',provider+' 连接测试失败：'+str(exc)))
             finally:self.events.put(('connection_done',None))
         threading.Thread(target=test,daemon=True).start()
 
@@ -346,7 +360,7 @@ class App:
             elif kind=='preview':
                 self.pending=value; self.log('回复预览：'+value[2])
             elif kind=='sent':self.pending=None; self.log('已发送')
-            elif kind=='connection_done':self.status.set('MiMo 连接测试结束，详情见日志')
+            elif kind=='connection_done':self.status.set('模型连接测试结束，详情见微信自动回复页日志')
             elif kind=='done':self.running=False; self.start_button.configure(state='normal'); self.window_choice.configure(state='readonly'); self.status.set('已停止')
         self.root.after(200,self.pump)
 
@@ -360,7 +374,7 @@ if __name__=='__main__':
         if '--box' in sys.argv:
             x,y,w,h=map(int,sys.argv[sys.argv.index('--box')+1].split(',')); image=image.crop((x,y,x+w,y+h))
         view=asyncio.run(recognition.analyze(image,0,(0,0,image.width,image.height),recognize_image))
-        report={'version':'0.5.0','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
+        report={'version':'0.5.1','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
         (ROOT/'ocr-check.json').write_text(json.dumps(report,ensure_ascii=True,indent=2),'utf-8')
         sys.exit(0)
     if '--self-test' in sys.argv:
@@ -390,6 +404,6 @@ if __name__=='__main__':
         ImageDraw.Draw(sample).text((10,10),'你好 微信 测试',font=ImageFont.truetype('msyh.ttc',32),fill='black')
         result=asyncio.run(recognize_image(sample))
         assert '你好' in ''.join(result.text.split()), repr(result.text)
-        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 0.5.0: Studio pages + isolated demo corpus + locked HWND capture + bundled RapidOCR model','utf-8')
+        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 0.5.1: Studio pages + isolated demo corpus + locked HWND capture + bundled RapidOCR model','utf-8')
         sys.exit(0)
     App(tk.Tk()).root.mainloop()

@@ -22,7 +22,7 @@ class StudioUI:
         self.lab_contact=tk.StringVar(); self.memory_contact=tk.StringVar()
         self.backend=tk.StringVar(value=str(self.root_path/'vendor'/'wetrace'/'wetrace.exe'))
         self._style()
-        self.root.title('微信分身 Studio · 0.5.0')
+        self.root.title('微信分身 Studio · 0.5.1')
         self.root.geometry('1180x850'); self.root.minsize(1040,760)
         shell=ttk.Frame(self.root); shell.pack(fill='both',expand=True)
         rail=tk.Frame(shell,bg='#152538',width=205); rail.pack(side='left',fill='y'); rail.pack_propagate(False)
@@ -34,7 +34,7 @@ class StudioUI:
             self.pages[name]=page
             button=tk.Button(rail,text=name,anchor='w',relief='flat',bd=0,bg='#152538',fg='#c8d5e5',activebackground='#253d55',activeforeground='white',font=('Microsoft YaHei UI',12),padx=24,pady=13,command=lambda n=name:self.show(n))
             button.pack(fill='x',padx=10,pady=2); self.nav[name]=button
-        tk.Label(rail,text='记录保存在本机\n仅按需提交片段给 MiMo',justify='left',font=('Microsoft YaHei UI',9),fg='#9bb0c7',bg='#152538',wraplength=170).pack(side='bottom',padx=20,pady=30)
+        tk.Label(rail,text='记录保存在本机\n支持 MiMo / 本地 Ollama',justify='left',font=('Microsoft YaHei UI',9),fg='#9bb0c7',bg='#152538',wraplength=170).pack(side='bottom',padx=20,pady=30)
         self.overview(); self.corpus(); self.persona(); self.memories(); self.laboratory(); self.automation(); self.settings()
         ttk.Label(self.root,textvariable=app.status,padding=(220,8),style='Hint.TLabel').pack(side='bottom',fill='x')
         self.refresh(); self.show('总览')
@@ -254,7 +254,7 @@ class StudioUI:
         if selected:self.store.delete_memory(self.memory_rows[selected[0]]['id']); self.load_memories()
 
     def laboratory(self):
-        page=self.pages['回复试验室']; self.heading(page,'先聊一聊，检查像不像你','这里不会操作微信。点击生成时，相关风格示例、选中联系人的记忆及片段会提交到你配置的 MiMo。')
+        page=self.pages['回复试验室']; self.heading(page,'先聊一聊，检查像不像你','这里不会操作微信。风格、记忆和相关片段交给选定的模型：支持 MiMo 或本地 Ollama。')
         self.lab_combo=ttk.Combobox(page,textvariable=self.lab_contact,state='readonly'); self.lab_combo.pack(fill='x')
         ttk.Label(page,text='对方说了什么').pack(anchor='w',pady=(15,4))
         self.lab_input=tk.Text(page,height=4,font=('Microsoft YaHei UI',11),relief='flat',wrap='word',padx=12,pady=10); self.lab_input.pack(fill='x')
@@ -315,14 +315,22 @@ class StudioUI:
         def wheel(event):
             if getattr(self,'current_page','')=='模型与工具' and not isinstance(event.widget,tk.Text):canvas.yview_scroll(-int(event.delta/120),'units')
         self.root.bind_all('<MouseWheel>',wheel,add='+')
-        self.heading(page,'模型与工具','MiMo 接入、WeTrace 导出工具与本地数据位置，集中管理。')
-        for name,label in [('base_url','MiMo Base URL'),('model','模型 ID')]:
-            ttk.Label(page,text=label).pack(anchor='w',pady=(8,4)); app.vars[name]=tk.StringVar(value=app.cfg[name]); ttk.Entry(page,textvariable=app.vars[name]).pack(fill='x')
+        self.heading(page,'模型与工具','MiMo 云端 / Ollama、LM Studio 本地模型，复用同一份聊天风格和联系人记忆。')
+        ttk.Label(page,text='模型服务').pack(anchor='w',pady=(4,4))
+        app.vars['provider']=tk.StringVar(value=app.cfg.get('provider','mimo'))
+        self.provider_choice=tk.StringVar(value={'ollama':'本机 Ollama','lmstudio':'本机 LM Studio'}.get(app.vars['provider'].get(),'小米 MiMo'))
+        provider=ttk.Combobox(page,textvariable=self.provider_choice,values=['小米 MiMo','本机 Ollama','本机 LM Studio'],state='readonly'); provider.pack(fill='x'); provider.bind('<<ComboboxSelected>>',self.change_provider)
+        for name,label in [('base_url','服务 Base URL'),('model','模型 ID（可读取本地服务列表）')]:
+            ttk.Label(page,text=label).pack(anchor='w',pady=(8,4)); app.vars[name]=tk.StringVar(value=app.cfg[name])
+            if name=='model':self.model_choice=ttk.Combobox(page,textvariable=app.vars[name]); self.model_choice.pack(fill='x')
+            else:ttk.Entry(page,textvariable=app.vars[name]).pack(fill='x')
+        ttk.Button(page,text='读取本地模型列表',command=self.load_ollama_models).pack(anchor='w',pady=5)
         ttk.Label(page,text='API Key（仅本次运行保存，不写入磁盘）').pack(anchor='w',pady=(12,4))
-        app.key=tk.StringVar(value=os.environ.get('MIMO_API_KEY','')); ttk.Entry(page,textvariable=app.key,show='•').pack(fill='x')
+        app.key=tk.StringVar(value=os.environ.get('MIMO_API_KEY','')); self.key_entry=ttk.Entry(page,textvariable=app.key,show='•'); self.key_entry.pack(fill='x')
+        if app.vars['provider'].get() in ('ollama','lmstudio'):self.key_entry.configure(state='disabled')
         row=ttk.Frame(page); row.pack(fill='x',pady=12)
-        for text,url in [('按量付费','https://api.xiaomimimo.com/v1'),('Token Plan 中国','https://token-plan-cn.xiaomimimo.com/v1')]:ttk.Button(row,text=text,command=lambda u=url:app.vars['base_url'].set(u)).pack(side='left',padx=(0,6))
-        ttk.Button(row,text='测试 MiMo 连接',command=app.test_connection).pack(side='left')
+        for text,url in [('按量付费','https://api.xiaomimimo.com/v1'),('Token Plan 中国','https://token-plan-cn.xiaomimimo.com/v1')]:ttk.Button(row,text=text,command=lambda u=url:self.cloud_preset(u)).pack(side='left',padx=(0,6))
+        ttk.Button(row,text='测试模型连接',command=app.test_connection).pack(side='left')
         ttk.Label(page,text='补充回复要求（风格学习启用后，会叠加在分身提示中）').pack(anchor='w',pady=(8,4))
         app.prompt=tk.Text(page,height=4,font=('Microsoft YaHei UI',10),wrap='word',relief='flat',padx=12,pady=10); app.prompt.insert('1.0',app.cfg['prompt']); app.prompt.pack(fill='x')
         ttk.Button(page,text='保存模型配置',style='Accent.TButton',command=app.save).pack(anchor='w',pady=10)
@@ -333,6 +341,42 @@ class StudioUI:
         ttk.Button(row,text='选择已有 WeTrace.exe',command=self.choose_backend).pack(side='left',padx=6)
         ttk.Label(page,text='WeTrace 导出中心在独立工具窗口打开；导出后回到“聊天记录”导入。WeTrace 组件沿用原作者非商业许可证。',style='Hint.TLabel',wraplength=850).pack(anchor='w',pady=8)
         ttk.Label(page,text='本地记录库：'+str(self.store.path),style='Hint.TLabel',wraplength=850).pack(anchor='w',pady=8)
+
+    def change_provider(self,event=None):
+        provider={'本机 Ollama':'ollama','本机 LM Studio':'lmstudio'}.get(self.provider_choice.get(),'mimo')
+        local=provider!='mimo'
+        self.app.vars['provider'].set(provider)
+        self.app.vars['base_url'].set({'ollama':'http://127.0.0.1:11434/v1','lmstudio':'http://127.0.0.1:1234/v1','mimo':'https://api.xiaomimimo.com/v1'}[provider])
+        self.app.vars['model'].set('' if local else 'mimo-v2.6-pro')
+        self.key_entry.configure(state='disabled' if local else 'normal')
+        self.model_choice['values']=[]
+        self.app.status.set('本地模式不使用 MiMo Key；请先启动模型服务，再读取模型列表' if local else '已切换到 MiMo，请检查 Key')
+
+    def cloud_preset(self,url):
+        self.provider_choice.set('小米 MiMo'); self.change_provider(); self.app.vars['base_url'].set(url)
+
+    def load_ollama_models(self):
+        provider=self.app.vars['provider'].get()
+        if provider not in ('ollama','lmstudio'):return messagebox.showinfo('本地模型','请先选择本机 Ollama 或 LM Studio')
+        base=self.app.vars['base_url'].get().strip()
+        from urllib.parse import urlsplit,urlunsplit
+        parsed=urlsplit(base)
+        if parsed.scheme not in ('http','https') or not parsed.hostname:return messagebox.showerror('服务地址','请填写本地服务地址：Ollama 11434 / LM Studio 1234')
+        url=urlunsplit((parsed.scheme,parsed.netloc,'/v1/models' if provider=='lmstudio' else '/api/tags','',''))
+        def work():
+            try:
+                opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(url,timeout=5) as response:data=json.load(response)
+            except Exception:raise ValueError('无法读取本地模型，请启动模型服务。Ollama 默认11434；LM Studio 默认1234，需开启 Developer 中的服务。') from None
+            if provider=='lmstudio':return [row['id'] for row in data.get('data',[]) if row.get('id')]
+            return [row['name'] for row in data.get('models',[]) if row.get('name') and not row.get('remote_host') and not row['name'].endswith((':cloud','-cloud'))]
+        def done(models):
+            self.model_choice['values']=models
+            if models:
+                if self.app.vars['model'].get() not in models:self.app.vars['model'].set(models[0])
+                self.app.status.set(f'已读取 {len(models)} 个本地模型，请选择后测试连接')
+            else:self.app.status.set('未找到模型，请先在本地服务中下载并加载模型；不自动下载')
+        self.run(work,done)
 
     def choose_backend(self):
         path=filedialog.askopenfilename(title='选择 WeTrace.exe',filetypes=[('程序','*.exe')])
