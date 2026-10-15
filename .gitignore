@@ -8,3 +8,6 @@ self-test.txt
 .env*
 release/
 *.zip
+private-tests/
+regression-report.json
+ocr-check.json
