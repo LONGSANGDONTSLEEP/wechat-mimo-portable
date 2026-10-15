@@ -3,6 +3,8 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 import re
+from collections import Counter
+from difflib import SequenceMatcher
 
 def enable_dpi_awareness():
     try:
@@ -124,6 +126,122 @@ class View:
     message: str
     input_point: tuple
     unread: list
+    header: bytes = b''
+    messages: tuple = ()
+
+@dataclass(frozen=True)
+class Bubble:
+    side: str
+    box: tuple
+    text: str = ''
+
+def clean_text(text):
+    text=text.replace('\ufffd','').strip()
+    text=re.sub(r'(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])','',text)
+    text=re.sub(r'\s+([，。！？、；：])',r'\1',text)
+    return text
+
+def valid_title(text):
+    compact=''.join(text.split())
+    return bool(len(compact)>=2 and re.search(r'[A-Za-z\u3400-\u9fff]',compact)) or compact.isdigit() and len(compact)>=3
+
+def title_equal(first,second):
+    a=''.join(first.split()); b=''.join(second.split())
+    return a==b or min(len(a),len(b))>=4 and SequenceMatcher(None,a,b).ratio()>=.85
+
+def header_same(first,second):
+    if not first or not second or len(first)!=len(second):return False
+    differences=[abs(a-b) for a,b in zip(first,second) if min(a,b)<190]
+    return bool(differences) and sum(differences)/len(differences)<18
+
+def header_image(image,split):
+    from PIL import ImageOps,ImageFilter,ImageStat
+    w,h=image.size
+    crop=image.crop((split+12,8,max(split+60,w-145),min(65,h)))
+    gray=ImageOps.grayscale(crop)
+    if ImageStat.Stat(gray).median[0]<128:gray=ImageOps.invert(gray)
+    signature=ImageOps.autocontrast(gray).resize((128,24)).filter(ImageFilter.GaussianBlur(.7)).tobytes()
+    return crop,signature
+
+def prepare_ocr(image):
+    from PIL import ImageOps,ImageStat
+    gray=ImageOps.grayscale(image)
+    if ImageStat.Stat(gray).median[0]<128:gray=ImageOps.invert(gray)
+    gray=ImageOps.autocontrast(gray,cutoff=1)
+    # Work from native pixels. Never shrink Chinese glyphs before recognition.
+    gray=gray.resize((gray.width*3,gray.height*3))
+    return ImageOps.expand(gray,border=18,fill='white').convert('RGB')
+
+def bubbles(image,split,top):
+    """Find filled message bodies before OCR; green bodies remain outgoing at any x."""
+    from PIL import Image
+    w,h=image.size; scale=2
+    small=image.convert('RGB').resize((w//scale,h//scale),Image.Resampling.NEAREST)
+    pix=small.load(); left=max(0,(split+38)//scale); right=small.width-18
+    first=32; last=min(small.height-1,int(top)//scale-4)
+    histogram=Counter(tuple(c//8 for c in pix[x,y]) for y in range(first,last) for x in range(left,right))
+    if not histogram:return []
+    background=histogram.most_common(1)[0][0]
+    colors=[]
+    for color,count in histogram.most_common(18):
+        rgb=tuple(c*8+4 for c in color)
+        if count<50 or sum(abs(a-b) for a,b in zip(color,background))<3:continue
+        green=rgb[1]>rgb[0]*1.25 and rgb[1]>rgb[2]*1.12
+        neutral=max(rgb)-min(rgb)<24
+        if green or neutral:colors.append((color,'out' if green else 'in'))
+    found=[]
+    for color,side in colors:
+        points={(x,y) for y in range(first,last) for x in range(left,right) if tuple(c//8 for c in pix[x,y])==color}
+        while points:
+            seed=points.pop(); stack=[seed]; component=[seed]
+            while stack:
+                x,y=stack.pop()
+                for p in ((x-1,y),(x+1,y),(x,y-1),(x,y+1)):
+                    if p in points:points.remove(p); stack.append(p); component.append(p)
+            if len(component)<65:continue
+            xs=[p[0] for p in component]; ys=[p[1] for p in component]
+            x0,y0,x1,y1=min(xs),min(ys),max(xs)+1,max(ys)+1
+            bw,bh=(x1-x0)*scale,(y1-y0)*scale
+            if bw<24 or bh<20 or len(component)/((x1-x0)*(y1-y0))<.57:continue
+            if bh>250 or bw>w-split-60:continue
+            # Incoming neutral bubbles sit next to the left avatar, not at the right edge.
+            if side=='in' and not split+42<=x0*scale<=split+125:continue
+            box=(x0*scale,y0*scale,x1*scale,y1*scale)
+            if any(abs(box[1]-b.box[1])<10 and abs(box[0]-b.box[0])<10 for b in found):continue
+            found.append(Bubble(side,box))
+    return sorted(found,key=lambda b:(b.box[1],b.box[0]))
+
+def message_tail(messages):
+    tail=[]
+    for bubble in reversed(messages):
+        if bubble.side=='out':break
+        if bubble.text:tail.append(bubble.text)
+    return '\n'.join(reversed(tail))
+
+def message_equal(first,second):
+    if first.side!=second.side:return False
+    if first.side=='out':return True
+    a=''.join(first.text.split()); b=''.join(second.text.split())
+    return a==b or min(len(a),len(b))>=8 and SequenceMatcher(None,a,b).ratio()>=.9
+
+class MessageTracker:
+    def __init__(self,messages):self.previous=tuple(messages)
+
+    def observe(self,messages):
+        current=tuple(messages); previous=self.previous
+        if not current:return ''
+        self.previous=current
+        if not previous:return message_tail(current)
+        # Only append-only transitions can trigger a reply. OCR wobble, scrolling and
+        # disappearing historical bubbles reset the baseline without replying.
+        overlap=0
+        for size in range(min(len(previous),len(current)),0,-1):
+            if all(message_equal(a,b) for a,b in zip(previous[-size:],current[:size])):
+                overlap=size; break
+        if not overlap or len(current)<=overlap:return ''
+        new=current[overlap:]
+        if not new or new[-1].side!='in':return ''
+        return message_tail(new)
 
 def find_wechat():
     user=ctypes.windll.user32
@@ -179,7 +297,7 @@ def flatten(result):
 def divider(image):
     # Find a long, thin vertical border separating conversation list and chat.
     im=image.convert('RGB'); w,h=im.size; pixels=im.load(); candidates=[]
-    for x in range(int(w*.20),int(w*.48)):
+    for x in range(int(w*.08),int(w*.55)):
         score=0
         for y in range(100,h-100,5):
             center=pixels[x,y]; left=pixels[x-3,y]; right=pixels[x+3,y]

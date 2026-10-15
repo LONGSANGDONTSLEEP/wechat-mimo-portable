@@ -13,6 +13,11 @@ from tkinter import ttk, messagebox
 import urllib.request
 import urllib.error
 import vision
+import recognition
+from types import SimpleNamespace
+
+_ocr_engine=None
+_ocr_lock=threading.Lock()
 
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 DEFAULT = dict(base_url='https://api.xiaomimimo.com/v1', model='mimo-v2.6-pro',
@@ -41,13 +46,21 @@ def completion(cfg, key, text, history):
     return answer.strip()
 
 async def recognize_image(image):
-    import winocr
-    return await winocr.recognize_pil(image, lang='zh-Hans')
+    global _ocr_engine
+    import numpy as np
+    from rapidocr_onnxruntime import RapidOCR
+    with _ocr_lock:
+        if _ocr_engine is None:_ocr_engine=RapidOCR(intra_op_num_threads=2,inter_op_num_threads=2)
+        result,_=_ocr_engine(np.asarray(image.convert('RGB')))
+    rows=[]
+    for box,text,confidence in result or []:
+        if float(confidence)>=.60:rows.append((min(p[1] for p in box),min(p[0] for p in box),text))
+    return SimpleNamespace(text='\n'.join(row[2] for row in sorted(rows)))
 
 class App:
     def __init__(self, root):
         self.root=root
-        root.title('微信 MiMo 助手 · 锁定窗口 OCR 0.3.0')
+        root.title('微信 MiMo 助手 · 气泡识别 OCR 0.4.0')
         root.geometry('800x780')
         self.cfg=DEFAULT.copy()
         if (ROOT/'config.json').exists():
@@ -83,6 +96,7 @@ class App:
         ttk.Button(row,text='停止 / Esc',command=self.halt).pack(side='left',padx=3)
         ttk.Button(row,text='发送当前预览',command=self.send_pending).pack(side='left',padx=3)
         ttk.Button(row,text='保存配置',command=self.save).pack(side='left',padx=3)
+        ttk.Button(row,text='仅测试识别',command=self.test_recognition).pack(side='left',padx=3)
         ttk.Label(frame,text='识别与回复预览（不写入磁盘）').pack(anchor='w')
         self.output=tk.Text(frame,wrap='word',height=14,state='disabled'); self.output.pack(fill='both',expand=True)
         self.status=tk.StringVar(value='未启动'); ttk.Label(frame,textvariable=self.status).pack(anchor='w',pady=5)
@@ -112,6 +126,18 @@ class App:
         try:image,rect=vision.capture_window(self.monitor['hwnd'],self.monitor['pid'])
         except Exception as exc:return messagebox.showerror('窗口截图',str(exc))
         from PIL import ImageTk,ImageDraw
+        display=image.copy()
+        try:
+            user=ctypes.windll.user32; user.GetDpiForWindow.argtypes=[ctypes.c_void_p]
+            factor=max(96,user.GetDpiForWindow(self.monitor['hwnd']))/96
+            logical,split,top=recognition.layout(image,factor)
+            painter=ImageDraw.Draw(display)
+            for body in vision.bubbles(logical,split,top):
+                box=tuple(round(v*factor) for v in body.box)
+                color='red' if body.side=='out' else '#00a0ff'
+                painter.rectangle(box,outline=color,width=3)
+                painter.text((box[0],box[1]),'OUT' if body.side=='out' else 'IN',fill=color)
+        except ValueError:pass
         dialog=tk.Toplevel(self.root); dialog.title('所选窗口预览：点击输入框设置发送位置，或拖选对方消息区域')
         self.preview_dialog=dialog
         scale=min(1,1000/image.width,650/image.height)
@@ -121,7 +147,7 @@ class App:
         ttk.Radiobutton(controls,text='点击设置输入框',variable=mode,value='input').pack(side='left')
         ttk.Radiobutton(controls,text='拖选对方消息区域（可选，改善识别）',variable=mode,value='crop').pack(side='left')
         canvas=tk.Canvas(dialog,width=int(image.width*scale),height=int(image.height*scale)); canvas.pack()
-        canvas.preview_image=ImageTk.PhotoImage(image.resize((int(image.width*scale),int(image.height*scale))))
+        canvas.preview_image=ImageTk.PhotoImage(display.resize((int(image.width*scale),int(image.height*scale))))
         canvas.create_image(0,0,anchor='nw',image=canvas.preview_image)
         label=ttk.Label(dialog,text='未设置发送位置'); label.pack(anchor='w',padx=8,pady=6)
         origin=[]; box=[]
@@ -185,58 +211,63 @@ class App:
         user=ctypes.windll.user32
         user.GetDpiForWindow.argtypes=[ctypes.c_void_p]
         dpi=max(96,user.GetDpiForWindow(hwnd)); factor=dpi/96
-        logical=image.resize((round(image.width/factor),round(image.height/factor)))
-        enlarged=logical.resize((logical.width*2,logical.height*2))
-        result=asyncio.run(recognize_image(enlarged))
-        lines=[vision.Text(t.text,t.x/2,t.y/2,t.width/2,t.height/2) for t in vision.flatten(result)]
-        # Main-window parsing first; detached chats have no sidebar.
-        try:split=vision.divider(logical)
-        except ValueError:split=0
-        if self.monitor['crop']:
-            top=self.monitor['crop']['rect'][1]+self.monitor['crop']['rect'][3]
-            view=vision.parse(logical,lines,hwnd,rect,split_override=split,input_override=top/factor+16)
-        else:view=vision.parse(logical,lines,hwnd,rect,split_override=split)
+        crop_rect=None
         if self.monitor['crop']:
             crop=self.monitor['crop']
             if crop['size']!=list(rect[2:]):raise ValueError('窗口尺寸变化，请重新确认消息区域')
-            x,y,w,h=crop['rect']; cropped=image.crop((x,y,x+w,y+h))
-            cropped=cropped.resize((cropped.width*2,cropped.height*2))
-            view.message=asyncio.run(recognize_image(cropped)).text.strip()
+            crop_rect=crop['rect']
+        view=asyncio.run(recognition.analyze(image,hwnd,rect,recognize_image,factor,crop_rect))
         view.input_point=vision.confirmed_point(rect,self.monitor['input']) if self.monitor['input'] else None
-        view.unread=[]
         return view
+
+    def test_recognition(self):
+        if self.running:return messagebox.showinfo('测试识别','请先停止监听')
+        if not self.monitor:return messagebox.showinfo('测试识别','请先选择微信窗口')
+        def test():
+            try:
+                view=self.inspect(self.monitor['hwnd'])
+                self.events.put(('log','识别测试（未调用AI、未发送）：标题='+repr(view.title)))
+                for body in view.messages:self.events.put(('log',('对方：'+body.text) if body.side=='in' else '自己：绿色气泡已排除'))
+                self.events.put(('log','当前待回复：'+(view.message or '无（最新为自己发送，或无新文字）')))
+            except Exception as exc:self.events.put(('log','识别测试失败：'+str(exc)))
+        threading.Thread(target=test,daemon=True).start()
 
     def worker(self,cfg,key):
         try:
             hwnd=self.monitor['hwnd']
             view=self.inspect(hwnd)
-            locked_title=fingerprint(view.title)
-            self.seen.add(fingerprint(view.title+'\n'+view.message))
-            self.events.put(('log','已自动找到微信：'+view.title+'；当前旧消息已忽略。'))
+            if not view.title:raise ValueError('聊天标题未能可靠识别，请先点“仅测试识别”检查')
+            locked_title=view.title; locked_header=view.header
+            tracker=vision.MessageTracker(view.messages)
+            self.events.put(('log','已锁定微信：'+view.title+'；当前旧消息已忽略。'))
             candidate=''; count=0
-            histories={}
+            header_changes=0
             while not self.halted():
                 if self.stop.wait(cfg['interval']):break
                 if self.awaiting.is_set():continue
                 view=self.inspect(hwnd)
-                if fingerprint(view.title)!=locked_title:raise ValueError('所选窗口已切换聊天，监听已停止')
-                if cfg['title'] and fingerprint(cfg['title'])!=fingerprint(view.title):
+                if not vision.header_same(view.header,locked_header):
+                    header_changes+=1; count=0
+                    if header_changes>=3 and view.title and fingerprint(view.title)!=fingerprint(locked_title):
+                        raise ValueError('连续三次确认聊天标题变化，监听已停止')
+                    self.events.put(('log','标题图像暂不稳定，暂停本帧，不发送'))
+                    continue
+                header_changes=0; view.title=locked_title
+                if cfg['title'] and not vision.title_equal(cfg['title'],locked_title):
                     count=0; continue
-                text=view.message
-                if not text:continue
-                token=fingerprint(view.title+'\n'+text)
+                token=fingerprint(repr([(b.side,b.text) for b in view.messages]))
                 count=count+1 if token==candidate else 1; candidate=token
-                if token in self.seen:count=0; continue
                 if count<2:continue
-                self.seen.add(token)
+                text=tracker.observe(view.messages)
+                if not text:continue
+                if len(''.join(text.split()))>=12 and any(vision.message_equal(vision.Bubble('in',(),text),vision.Bubble('in',(),turn['content'])) for turn in self.history if turn['role']=='assistant'):
+                    self.events.put(('log','已排除与本程序历史回复相同的文字')); continue
                 self.events.put(('log','['+view.title+'] 识别：'+text))
-                self.history=histories.setdefault(view.title,[])
                 answer=completion(cfg,key,text,self.history)
                 if self.halted():break
                 if not cfg['auto']:self.awaiting.set()
                 self.events.put(('preview',(view,text,answer)))
                 if cfg['auto']:self.deliver(view,text,answer)
-                histories[view.title]=self.history
                 count=0
         except Exception as exc:self.events.put(('log','已停止：'+str(exc)))
         finally:self.stop.set(); self.events.put(('done',None))
@@ -250,7 +281,8 @@ class App:
         vision.activate(expected.hwnd); time.sleep(.3)
         if not vision.foreground(expected.hwnd):raise ValueError('无法激活锁定窗口，取消发送')
         current=self.inspect(expected.hwnd)
-        if fingerprint(current.title)!=fingerprint(expected.title) or fingerprint(current.message)!=fingerprint(text):
+        title_ok=vision.header_same(current.header,expected.header) if expected.header else fingerprint(current.title)==fingerprint(expected.title)
+        if not title_ok or not current.message or not vision.message_equal(vision.Bubble('in',(),current.message),vision.Bubble('in',(),expected.message)):
             raise ValueError('聊天或消息已变化，取消发送')
         vision.ensure_point(expected.hwnd,current.input_point)
         pyautogui.click(*current.input_point); time.sleep(0.25)
@@ -267,7 +299,8 @@ class App:
         pyperclip.copy(answer); pyautogui.hotkey('ctrl','v'); time.sleep(0.35)
         if self.halted():return
         current=self.inspect(expected.hwnd)
-        if fingerprint(current.title)!=fingerprint(expected.title):raise ValueError('聊天已变化，取消发送')
+        title_ok=vision.header_same(current.header,expected.header) if expected.header else fingerprint(current.title)==fingerprint(expected.title)
+        if not title_ok:raise ValueError('聊天标题图像已变化，取消发送')
         if self.halted():return
         if not vision.foreground(expected.hwnd):raise ValueError('窗口焦点变化，取消发送')
         pyautogui.press('enter')
@@ -303,9 +336,18 @@ class App:
 
 if __name__=='__main__':
     vision.enable_dpi_awareness()
+    if '--check-image' in sys.argv:
+        from PIL import Image
+        image=Image.open(sys.argv[sys.argv.index('--check-image')+1]).convert('RGB')
+        if '--box' in sys.argv:
+            x,y,w,h=map(int,sys.argv[sys.argv.index('--box')+1].split(',')); image=image.crop((x,y,x+w,y+h))
+        view=asyncio.run(recognition.analyze(image,0,(0,0,image.width,image.height),recognize_image))
+        report={'version':'0.4.0','title':view.title,'reply_input':view.message,'messages':[{'side':b.side,'text':b.text} for b in view.messages]}
+        (ROOT/'ocr-check.json').write_text(json.dumps(report,ensure_ascii=True,indent=2),'utf-8')
+        sys.exit(0)
     if '--self-test' in sys.argv:
         assert fingerprint('你好\n 世界')==fingerprint('你好 世界')
-        import pyautogui, pyperclip, winocr
+        import pyautogui, pyperclip
         from PIL import Image, ImageDraw, ImageFont
         window=tk.Tk(); instance=App(window); window.update()
         user=ctypes.windll.user32
@@ -318,6 +360,6 @@ if __name__=='__main__':
         ImageDraw.Draw(sample).text((10,10),'你好 微信 测试',font=ImageFont.truetype('msyh.ttc',32),fill='black')
         result=asyncio.run(recognize_image(sample))
         assert '你好' in ''.join(result.text.split()), repr(result.text)
-        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 0.3.0: GUI + locked HWND capture + Chinese OCR','utf-8')
+        (ROOT/'self-test.txt').write_text('SELF_TEST_OK 0.4.0: GUI + locked HWND capture + bundled RapidOCR model','utf-8')
         sys.exit(0)
     App(tk.Tk()).root.mainloop()
