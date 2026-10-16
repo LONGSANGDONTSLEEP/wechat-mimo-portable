@@ -97,6 +97,7 @@ def completion(cfg, key, text, history):
             detail=str(error.get('message',error) if isinstance(error,dict) else error)[:350]
         except Exception:pass
         from chatdata import redact
+        if local and 'no models loaded' in detail.lower():raise RuntimeError('本地服务已连接，但没有加载聊天模型。请在 LM Studio 的 Model Server 点击 Load Model，加载后读取模型列表并选择准确ID。') from None
         raise RuntimeError((f'本地模型服务 HTTP {exc.code}' if local else f'MiMo HTTP {exc.code}')+'：'+(redact(detail) or '请检查服务地址、模型名称与认证配置')) from None
     except UnicodeEncodeError:
         raise ValueError('请求头含非英文字符，尚未成功调用 MiMo。请重新复制 Key；若仍失败，请检查系统代理配置。') from None

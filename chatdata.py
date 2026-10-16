@@ -18,6 +18,7 @@ ALIASES={
     'time':('CreateTime','createTime','create_time','timestamp','time','datetime','时间','发送时间'),
     'type':('Type','type','msg_type','消息类型'),
 }
+CSV_ESCAPE_FIELD='_wechat_studio_csv_escaped'
 
 def pick(record,names,default=''):
     for name in names:
@@ -62,7 +63,17 @@ def read_rows(path):
     if suffix in ('.csv','.tsv'):
         try:dialect=csv.Sniffer().sniff(text[:8192],delimiters=',\t;')
         except csv.Error:dialect=csv.excel_tab if suffix=='.tsv' else csv.excel
-        return list(csv.DictReader(io.StringIO(text),dialect=dialect))
+        rows=list(csv.DictReader(io.StringIO(text),dialect=dialect))
+        for row in rows:
+            escaped=row.pop(CSV_ESCAPE_FIELD,'')
+            if not escaped:continue
+            try:fields=json.loads(escaped)
+            except (ValueError,TypeError):raise ValueError('本App CSV的转义标记损坏，请使用原始导出或JSON') from None
+            if not isinstance(fields,list) or any(not isinstance(field,str) or field not in ('contact','sender','role','time','content','type') for field in fields):raise ValueError('本App CSV的转义字段不正确')
+            for field in fields:
+                value=row.get(field,'')
+                if isinstance(value,str) and value.startswith("'") and value[1:].startswith(('=','+','-','@','\t','\r')):row[field]=value[1:]
+        return rows
     if suffix in ('.html','.htm'):
         parser=EmbeddedJSON(); parser.feed(text)
         for payload in parser.payloads:
@@ -142,18 +153,19 @@ class ChatStore:
     def set(self,key,value):
         with self.db() as db:db.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,json.dumps(value,ensure_ascii=False)))
 
-    def import_rows(self,rows,source):
+    def import_rows(self,rows,source,db=None):
+        if db is None:
+            with self.db() as connection:return self.import_rows(rows,source,connection)
         inserted=0
-        with self.db() as db:
-            for row in rows:
-                identity=[row['contact'],row['sender'],row['time'],row['text']]
-                if row.get('source_identity'):identity.append(row['source_identity'])
-                if not row['time']:identity.extend([str(source),row.get('row',0)])
-                digest=hashlib.sha256(json.dumps(identity,ensure_ascii=False).encode()).hexdigest()
-                cursor=db.execute('INSERT OR IGNORE INTO messages(contact,sender,role,ts,content,source,digest) VALUES(?,?,?,?,?,?,?)',
-                    (row['contact'],row['sender'],row['role'],row['time'],row['text'],str(source),digest))
-                inserted+=cursor.rowcount
-                if row['role']!='unknown':db.execute('UPDATE messages SET role=? WHERE digest=?',(row['role'],digest))
+        for row in rows:
+            identity=[row['contact'],row['sender'],row['time'],row['text']]
+            if row.get('source_identity'):identity.append(row['source_identity'])
+            if not row['time']:identity.extend([str(source),row.get('row',0)])
+            digest=hashlib.sha256(json.dumps(identity,ensure_ascii=False).encode()).hexdigest()
+            cursor=db.execute('INSERT OR IGNORE INTO messages(contact,sender,role,ts,content,source,digest) VALUES(?,?,?,?,?,?,?)',
+                (row['contact'],row['sender'],row['role'],row['time'],row['text'],str(source),digest))
+            inserted+=cursor.rowcount
+            if row['role']!='unknown':db.execute('UPDATE messages SET role=? WHERE digest=?',(row['role'],digest))
         return inserted
 
     def stats(self):

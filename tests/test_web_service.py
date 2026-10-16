@@ -117,4 +117,53 @@ class WebTests(unittest.TestCase):
             entry=self.wait(self.request('/api/analysis',{'contact':'甲','range':'最近一周（7天）'})['job'])
             self.assertEqual(entry['state'],'error');call.assert_not_called()
 
+    def test_plain_db_needs_no_pid_even_when_experimental_flag_is_left_on(self):
+        import sqlite3
+        path=Path(self.tmp.name)/'plain.db'
+        db=sqlite3.connect(path)
+        try:
+            db.execute('CREATE TABLE MSG(StrTalker TEXT,IsSender INTEGER,CreateTime TEXT,StrContent TEXT,Type INTEGER)')
+            db.execute("INSERT INTO MSG VALUES('fixture',0,'2026-10-16','plain fixture',1)");db.commit()
+        finally:db.close()
+        with patch('wechat_keys.find_keys') as scan:
+            entry=self.wait(self.request('/api/local-import',{'path':str(path),'auto_key':True,'pid':''})['job'])
+            self.assertEqual(entry['state'],'success');scan.assert_not_called()
+
+    def test_encrypted_import_rejects_empty_pid_and_keeps_other_processes_after_denial(self):
+        import wechat_keys
+        path=Path(self.tmp.name)/'message_0.db';path.write_bytes(b'not-sqlite'+bytes(4096-10))
+        params={'path':str(path),'auto_key':True,'pid':''}
+        with patch('wechat_keys.related_processes',return_value=[1,2]),patch('wechat_keys.find_keys') as scan:
+            entry=self.wait(self.request('/api/local-import',params)['job'])
+            self.assertEqual(entry['state'],'error');self.assertIn('请选择',entry['error']);scan.assert_not_called()
+        denied=wechat_keys.ProcessAccessError(1,5,'WinError 5: access denied')
+        with patch('wechat_keys.related_processes',return_value=[1,2]),patch('wechat_keys.find_keys',side_effect=[denied,{}]) as scan:
+            entry=self.wait(self.request('/api/local-import',dict(params,pid=1))['job'])
+            self.assertEqual(scan.call_count,2)
+            self.assertEqual(entry['state'],'error');self.assertIn('当前微信版本的自动解密尚不可用',entry['error'])
+
+    def test_encrypted_key_and_nonmessage_source_errors_are_actionable(self):
+        path=Path(self.tmp.name)/'message_0.db';path.write_bytes(b'not-sqlite'+bytes(4096-10))
+        for params,expected in (({'key':'xyz'},'64位'),({'pid':''},'已加密')):
+            entry=self.wait(self.request('/api/local-import',dict(path=str(path),**params))['job'])
+            self.assertIn(expected,entry['error'])
+        import sqlite3
+        config=Path(self.tmp.name)/'config.db';db=sqlite3.connect(config)
+        try:db.execute('CREATE TABLE settings(name,value)');db.commit()
+        finally:db.close()
+        entry=self.wait(self.request('/api/local-import',{'path':str(config)})['job'])
+        self.assertIn('可能是配置库',entry['error'])
+
+    def test_downloads_from_same_second_do_not_overwrite_previous_exports(self):
+        self.state.library.import_rows([{'contact':'first','sender':'x','role':'other','content':'first fixture'},
+                                       {'contact':'second','sender':'y','role':'other','content':'second fixture'}],'fixture')
+        with patch('web_service.time.strftime',return_value='fixed-second'):
+            first=self.wait(self.request('/api/export',{'format':'json','contact':'first'})['job'])['result']
+            second=self.wait(self.request('/api/export',{'format':'json','contact':'second'})['job'])['result']
+            self.assertNotEqual(first['name'],second['name'])
+            old=self.request(first['download'],raw=True)[2]
+            self.assertIn(b'first fixture',old);self.assertNotIn(b'second fixture',old)
+            backups=[self.wait(self.request('/api/backup',{})['job'])['result'] for _ in range(2)]
+            self.assertNotEqual(backups[0]['name'],backups[1]['name'])
+
 if __name__=='__main__':unittest.main()

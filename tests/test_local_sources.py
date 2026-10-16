@@ -2,12 +2,13 @@ from contextlib import closing
 from pathlib import Path
 import hashlib
 import hmac
+import ctypes
 import json
 import sqlite3
 import struct
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch,Mock
 import localdb
 import wechat_keys
 from chatdata import ChatStore
@@ -205,8 +206,170 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(wechat_keys.find_keys(123,[]),{});processes.assert_not_called()
             with self.assertRaisesRegex(ValueError,'首页不完整'):wechat_keys.find_keys(123,[b'incomplete'])
             processes.assert_not_called()
-            with self.assertRaisesRegex(ValueError,'微信进程'):wechat_keys.find_keys(123,[bytes(4096)])
+            with self.assertRaisesRegex(wechat_keys.ProcessAccessError,'微信进程') as failure:wechat_keys.find_keys(123,[bytes(4096)])
+            self.assertEqual(failure.exception.pid,123);self.assertEqual(failure.exception.winerror,87)
             processes.assert_called_once_with(0)
+
+    def fake_memory_kernel(self,block,memory=None,exited=False):
+        kernel=Mock();kernel.OpenProcess.return_value=55;memory={0x10000:block,**(memory or {})}
+        def query(handle,address,region,size):
+            if not address.value:
+                target=region._obj;target.BaseAddress=0x10000;target.RegionSize=len(block);target.State=0x1000;target.Protect=4;target.Type=0x20000
+                return ctypes.sizeof(target)
+            ctypes.set_last_error(87);return 0
+        def read(handle,address,buffer,count,result):
+            data=memory.get(address.value)
+            if data is None:
+                data=next((content[address.value-start:] for start,content in memory.items() if start<address.value<start+len(content)),b'')
+            data=data[:count]
+            if data:ctypes.memmove(buffer,data,len(data))
+            result._obj.value=len(data)
+            return bool(data)
+        def exit_code(handle,result):result._obj.value=0 if exited else 259;return True
+        kernel.VirtualQueryEx.side_effect=query;kernel.ReadProcessMemory.side_effect=read;kernel.GetExitCodeProcess.side_effect=exit_code
+        return kernel
+
+    def test_key_scan_budget_also_covers_salt_reference_rescan(self):
+        salt=b'fixture-salt1234';page=salt+bytes(4096-len(salt));kernel=self.fake_memory_kernel(salt+bytes(48))
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'),patch('wechat_keys.MAX_SCAN_BYTES',96):
+            with self.assertRaisesRegex(wechat_keys.ScanLimitError,'预算') as failure:wechat_keys.find_keys(123,[page])
+            self.assertEqual(failure.exception.pid,123)
+        self.assertEqual(kernel.ReadProcessMemory.call_count,1);kernel.CloseHandle.assert_called_once_with(55)
+
+    def test_binary_key_reference_scan_handles_x86_and_x64_pointers(self):
+        key=bytes(range(32));salt=b'fixture-salt1234';page=encrypt_page(empty_sqlite(),1,key,salt)
+        for bits in (32,64):
+            block=bytearray(64);block[:16]=salt;format='<I' if bits==32 else '<Q'
+            struct.pack_into(format,block,32,0x10000);struct.pack_into(format,block,40,0x20000)
+            kernel=self.fake_memory_kernel(bytes(block),{0x20000:key+bytes(352)})
+            with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':bits}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'):
+                self.assertEqual(wechat_keys.find_keys(123,[page]),{salt.hex():key})
+            kernel.CloseHandle.assert_called_once_with(55)
+
+    def test_binary_string_material_without_salt_references_is_derived_and_authenticated(self):
+        material=bytes(range(32));salt=b'fixture-salt1234';key=localdb.derive_key(material,salt)
+        page=encrypt_page(empty_sqlite(),1,key,salt)
+        for bits in (32,64):
+            block=bytearray(64);integer='<I' if bits==32 else '<Q';struct.pack_into(integer,block,0,0x20000)
+            struct.pack_into(integer,block,16,32);struct.pack_into(integer,block,16+bits//8,47)
+            self.assertNotIn(salt,block);kernel=self.fake_memory_kernel(bytes(block),{0x20000:material})
+            with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':bits}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'):
+                self.assertEqual(wechat_keys.find_keys(123,[page]),{salt.hex():key})
+            kernel.CloseHandle.assert_called_once_with(55)
+
+    def test_binary_string_object_can_cross_a_scan_chunk_boundary(self):
+        material=bytes(range(32));salt=b'fixture-salt1234';key=localdb.derive_key(material,salt);page=encrypt_page(empty_sqlite(),1,key,salt)
+        block=bytearray(1024*1024+64);offset=1024*1024-20
+        struct.pack_into('<Q',block,offset,0x400000);struct.pack_into('<QQ',block,offset+16,32,47)
+        kernel=self.fake_memory_kernel(bytes(block),{0x400000:material})
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'):
+            self.assertEqual(wechat_keys.find_keys(123,[page]),{salt.hex():key})
+
+    def test_binary_key_and_salt_neighbors_do_not_require_a_pointer_reference(self):
+        material=bytes(range(32));salt=b'fixture-salt1234'
+        for derived,block in ((False,material+salt+bytes(16)),(False,salt+material+bytes(16)),(True,material+salt+bytes(16))):
+            key=localdb.derive_key(material,salt) if derived else material;page=encrypt_page(empty_sqlite(),1,key,salt);kernel=self.fake_memory_kernel(block)
+            with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'):
+                self.assertEqual(wechat_keys.find_keys(123,[page]),{salt.hex():key})
+
+    def test_candidate_derivation_budget_is_separate_from_cancellation(self):
+        salt=b'fixture-salt1234';key=bytes(range(32));page=encrypt_page(empty_sqlite(),1,key,salt);block=bytearray(128);memory={}
+        for index in range(3):
+            pointer=0x20000+index*0x100;struct.pack_into('<Q',block,index*40,pointer);struct.pack_into('<QQ',block,index*40+16,32,47)
+            memory[pointer]=hashlib.sha256(b'nonmatching-fixture'+bytes([index])).digest()
+        kernel=self.fake_memory_kernel(bytes(block),memory);details={}
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'),patch('wechat_keys.MAX_KDF_ATTEMPTS',2):
+            with self.assertRaisesRegex(wechat_keys.ScanLimitError,'候选派生预算'):wechat_keys.find_keys(123,[page],diagnostics=details)
+        self.assertTrue(details['direct_scan_complete']);self.assertFalse(details['scan_complete']);self.assertEqual(details['kdf_attempts'],2)
+        kernel.CloseHandle.assert_called_once_with(55)
+
+    def test_direct_salt_reference_is_checked_before_structured_derivation_budget(self):
+        salt=b'fixture-salt1234';key=bytes(range(32));page=encrypt_page(empty_sqlite(),1,key,salt)
+        block=bytearray(256);block[:16]=salt;struct.pack_into('<QQ',block,32,0x10000,0x20000)
+        memory={0x20000:key+bytes(352)}
+        for index in range(3):
+            pointer=0x30000+index*0x100;offset=64+index*40
+            struct.pack_into('<Q',block,offset,pointer);struct.pack_into('<QQ',block,offset+16,32,47)
+            memory[pointer]=hashlib.sha256(b'nonmatching-fixture'+bytes([index])).digest()
+        kernel=self.fake_memory_kernel(bytes(block),memory);details={}
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'),patch('wechat_keys.MAX_KDF_ATTEMPTS',2):
+            self.assertEqual(wechat_keys.find_keys(123,[page],diagnostics=details),{salt.hex():key})
+        self.assertEqual(details['kdf_attempts'],0);self.assertEqual(details['structured_candidates'],3)
+        kernel.CloseHandle.assert_called_once_with(55)
+
+    def test_utf8_heap_text_is_not_derived_but_can_authenticate_directly(self):
+        text='你好世界欢迎使用微信'.encode()+b'ab';self.assertEqual(len(text),32)
+        self.assertTrue(wechat_keys._ordinary_text(text));self.assertFalse(wechat_keys._ordinary_text(bytes(range(32))))
+        block=bytearray(64);struct.pack_into('<Q',block,0,0x20000);struct.pack_into('<QQ',block,16,32,47)
+        salt=b'fixture-salt1234';kernel=self.fake_memory_kernel(bytes(block),{0x20000:text});details={}
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'),patch('wechat_keys.derive_key') as derive:
+            self.assertEqual(wechat_keys.find_keys(123,[encrypt_page(empty_sqlite(),1,bytes(range(32)),salt)],diagnostics=details),{})
+            derive.assert_not_called();self.assertEqual(details['structured_candidates'],0)
+        kernel=self.fake_memory_kernel(bytes(block),{0x20000:text})
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'),patch('wechat_keys.derive_key') as derive:
+            self.assertEqual(wechat_keys.find_keys(123,[encrypt_page(empty_sqlite(),1,text,salt)]),{salt.hex():text})
+            derive.assert_not_called()
+
+    def test_process_access_is_distinct_from_cancellation_and_exit(self):
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':False,'winerror':5,'access_error':'WinError 5 权限级别不同'}),patch('wechat_keys._kernel') as kernel:
+            with self.assertRaises(wechat_keys.ProcessAccessError) as failure:wechat_keys.find_keys(123,[bytes(4096)])
+            self.assertIsInstance(failure.exception,PermissionError);self.assertNotIsInstance(failure.exception,ValueError)
+            self.assertEqual(failure.exception.winerror,5);kernel.assert_not_called()
+        kernel=self.fake_memory_kernel(b'no matching key'+bytes(48),exited=True)
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'):
+            with self.assertRaisesRegex(wechat_keys.ProcessAccessError,'已退出'):wechat_keys.find_keys(123,[bytes(4096)])
+        kernel.CloseHandle.assert_called_once_with(55)
+
+    def test_process_status_preserves_exact_permission_error_and_metadata(self):
+        kernel=Mock()
+        def open_process(rights,inherit,pid):
+            if rights==0x1000:return 11
+            ctypes.set_last_error(5);return None
+        def exit_code(handle,result):result._obj.value=259;return True
+        kernel.OpenProcess.side_effect=open_process;kernel.GetExitCodeProcess.side_effect=exit_code
+        metadata={'same_user':True,'caller_elevated':False,'target_elevated':True,'caller_integrity':'medium','target_integrity':'high','token_error':0}
+        with patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'),patch('wechat_keys._architecture',return_value=('x64',64)),patch('wechat_keys._token_comparison',return_value=metadata):
+            status=wechat_keys.process_status(123)
+        self.assertFalse(status['accessible']);self.assertTrue(status['running']);self.assertEqual(status['winerror'],5)
+        self.assertEqual(status['caller_integrity'],'medium');self.assertEqual(status['target_integrity'],'high')
+        self.assertIn('WinError 5',status['access_error']);kernel.CloseHandle.assert_called_once_with(11)
+        self.assertEqual(wechat_keys.process_status('')['winerror'],87)
+
+    def test_zero_byte_scan_reports_read_api_error_instead_of_zero_matches(self):
+        kernel=self.fake_memory_kernel(bytes(64))
+        def denied(handle,address,buffer,count,result):ctypes.set_last_error(5);result._obj.value=0;return False
+        kernel.ReadProcessMemory.side_effect=denied
+        with patch('wechat_keys.related_processes',return_value=[123]),patch('wechat_keys.process_status',return_value={'accessible':True,'target_bits':64}),patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'):
+            with self.assertRaises(wechat_keys.ProcessAccessError) as failure:wechat_keys.find_keys(123,[bytes(4096)])
+        self.assertEqual(failure.exception.winerror,5);self.assertIn('没有成功读取',str(failure.exception))
+        kernel.CloseHandle.assert_called_once_with(55)
+
+    def test_related_processes_stays_in_selected_wechat_family(self):
+        kernel=Mock();kernel.CreateToolhelp32Snapshot.return_value=11
+        entries=[(101,10),(102,101),(201,20)];index=0
+        def next_entry(handle,entry):
+            nonlocal index
+            if index==len(entries):return False
+            target=entry._obj;target.th32ProcessID,target.th32ParentProcessID=entries[index];target.szExeFile='Weixin.exe';index+=1;return True
+        kernel.Process32FirstW.side_effect=next_entry;kernel.Process32NextW.side_effect=next_entry
+        with patch('wechat_keys._kernel',return_value=kernel):self.assertEqual(wechat_keys.related_processes(101),[101,102])
+        kernel.CloseHandle.assert_called_once_with(11)
+
+    def test_process_status_rejects_cross_bitness_and_other_windows_user(self):
+        for caller_bits,same_user,expected in ((32,True,50),(64,False,5)):
+            kernel=Mock();kernel.OpenProcess.return_value=11
+            def exit_code(handle,result):result._obj.value=259;return True
+            kernel.GetExitCodeProcess.side_effect=exit_code
+            with patch('wechat_keys._kernel',return_value=kernel),patch('wechat_keys._image_name',return_value='weixin.exe'),patch('wechat_keys._architecture',return_value=('x64',64)),patch('wechat_keys._token_comparison',return_value={'same_user':same_user}),patch('wechat_keys.ctypes.sizeof',return_value=caller_bits//8):
+                status=wechat_keys.process_status(123)
+            self.assertFalse(status['accessible']);self.assertEqual(status['winerror'],expected)
+            kernel.OpenProcess.assert_called_once_with(0x1000,False,123);kernel.CloseHandle.assert_called_once_with(11)
+
+    def test_snapshot_enumeration_failure_preserves_windows_error(self):
+        kernel=Mock();kernel.CreateToolhelp32Snapshot.return_value=ctypes.c_void_p(-1).value;ctypes.set_last_error(5)
+        with patch('wechat_keys._kernel',return_value=kernel):
+            with self.assertRaises(wechat_keys.ProcessAccessError) as failure:wechat_keys.related_processes(0)
+        self.assertEqual(failure.exception.winerror,5);kernel.CloseHandle.assert_not_called()
 
     def test_full_workspace_media_roundtrip_and_tamper_rejection(self):
         import zipfile

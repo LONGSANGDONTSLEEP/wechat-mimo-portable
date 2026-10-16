@@ -43,6 +43,9 @@ def validate_database(path):
         for table,columns in TABLES.items():
             if {r[1] for r in db.execute(f'PRAGMA table_info({table})')} != columns:
                 raise ValueError('备份缺少记录、记忆或配置表：'+table)
+        for (value,) in db.execute('SELECT value FROM settings'):
+            try:json.loads(value)
+            except (ValueError,TypeError):raise ValueError('备份中的工作区设置损坏，尚未恢复') from None
         return {table:db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in TABLES}
 
 

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from collections import Counter
 from toolbox import parse_time
+from chatdata import CSV_ESCAPE_FIELD
 
 
 def query(store, contact='', keyword='', offset=0, limit=200):
@@ -37,10 +38,15 @@ def export_file(path, rows):
         path.write_text(json.dumps({'messages': data}, ensure_ascii=False, indent=2), 'utf-8')
     elif path.suffix.lower() == '.csv':
         with path.open('w', encoding='utf-8-sig', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=['contact','sender','role','time','content']+(['type'] if typed else []))
+            writer = csv.DictWriter(stream, fieldnames=['contact','sender','role','time','content']+(['type'] if typed else [])+[CSV_ESCAPE_FIELD])
             writer.writeheader()
             # Spreadsheet formulas must stay plain text when CSV is opened in Excel.
-            writer.writerows({k: "'"+v if v.startswith(('=','+','-','@','\t','\r')) else v for k,v in row.items()} for row in data)
+            for row in data:
+                escaped=[key for key,value in row.items() if value.startswith(('=','+','-','@','\t','\r'))]
+                safe={key:"'"+value if key in escaped else value for key,value in row.items()}
+                # The explicit marker makes only our own escaping reversible. A
+                # genuine apostrophe in an arbitrary imported CSV stays intact.
+                safe[CSV_ESCAPE_FIELD]=json.dumps(escaped);writer.writerow(safe)
     elif path.suffix.lower() in ('.html', '.htm'):
         cards = ''.join('<article><small>' + html.escape(r['time']+' · '+r['contact']+' · '+r['sender']) + '</small><p>' + html.escape(r['content']) + '</p></article>' for r in data)
         payload = json.dumps(data, ensure_ascii=False).replace('<', '\\u003c').replace('>', '\\u003e').replace('&','\\u0026')

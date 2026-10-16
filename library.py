@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import shutil
+import tempfile
 from chatdata import normalize_rows,pick,ALIASES
 from toolbox import parse_time
 
@@ -25,6 +26,7 @@ class Library:
             kind=str(row.get('kind',pick(row,ALIASES['type'],'1'))).lower()
             if kind in ('1','text','文本','0',''):
                 normalized=normalize_rows([row],default,self_names)
+                for item in normalized:item['row']=index
                 if row.get('source_id') is not None:
                     for item in normalized:item['source_identity']=str(source)+'#'+str(row.get('table',''))+'#'+str(row['source_id'])
                 text.extend(normalized);continue
@@ -37,13 +39,15 @@ class Library:
             normalized=normalize_rows([copy],default,self_names)
             if not normalized:continue
             r=normalized[0];r['text']=body;r['kind']=int(kind) if kind.isdecimal() else 0
+            r['row']=index
             if row.get('source_id') is not None:r['source_identity']=str(source)+'#'+str(row.get('table',''))+'#'+str(row['source_id'])
             media.append(r)
-        inserted=self.store.import_rows(text,source)
         with self.store.db() as db:
+            inserted=self.store.import_rows(text,source,db)
             for row in media:
                 identity=[row['contact'],row['sender'],row['time'],row['kind'],row['text']]
                 if row.get('source_identity'):identity.append(row['source_identity'])
+                if not row['time']:identity.extend([str(source),row['row']])
                 digest=hashlib.sha256(json.dumps(identity,ensure_ascii=False).encode()).hexdigest()
                 inserted+=db.execute('INSERT OR IGNORE INTO media_items(contact,sender,role,ts,content,kind,source,digest) VALUES(?,?,?,?,?,?,?,?)',(row['contact'],row['sender'],row['role'],row['time'],row['text'],row['kind'],str(source),digest)).rowcount
                 if row['role']!='unknown':db.execute('UPDATE media_items SET role=? WHERE digest=?',(row['role'],digest))
@@ -82,20 +86,32 @@ class Library:
     def add_asset(self,path,name=None):
         path=Path(path);name=Path(name or path.name).name
         if path.stat().st_size>512*1024*1024:raise ValueError('单个媒体文件超过512MB')
-        sha=hashlib.sha256();md5=hashlib.md5()
-        with path.open('rb') as stream:
-            for block in iter(lambda:stream.read(1024*1024),b''):sha.update(block);md5.update(block)
-        identity=sha.hexdigest()
-        with self.store.db() as db:
-            if db.execute('SELECT 1 FROM assets WHERE id=?',(identity,)).fetchone():return identity
-        extension=Path(name).suffix.lower()
-        if extension not in ('.jpg','.jpeg','.png','.gif','.webp','.bmp','.mp4','.webm','.mp3','.wav','.ogg','.m4a','.silk','.dat','.pdf','.txt'):extension='.bin'
-        filename=identity+extension;destination=self.root/filename
-        if not destination.exists():
-            temporary=self.root/(filename+'.partial');shutil.copyfile(path,temporary);os.replace(temporary,destination)
-        mime=mimetypes.guess_type(name)[0] or 'application/octet-stream'
-        with self.store.db() as db:db.execute('INSERT OR IGNORE INTO assets VALUES(?,?,?,?,?,?)',(identity,name,mime,destination.stat().st_size,filename,md5.hexdigest()))
-        return identity
+        sha=hashlib.sha256();md5=hashlib.md5();size=0;temporary=None
+        try:
+            # Hash exactly the bytes copied in one pass, even if the source file
+            # changes. Unique staging files also permit concurrent equal uploads.
+            with path.open('rb') as stream,tempfile.NamedTemporaryFile(dir=self.root,prefix='.asset-',suffix='.partial',delete=False) as target:
+                temporary=Path(target.name)
+                for block in iter(lambda:stream.read(1024*1024),b''):
+                    size+=len(block)
+                    if size>512*1024*1024:raise ValueError('单个媒体文件超过512MB')
+                    sha.update(block);md5.update(block);target.write(block)
+            identity=sha.hexdigest()
+            extension=Path(name).suffix.lower()
+            if extension not in ('.jpg','.jpeg','.png','.gif','.webp','.bmp','.mp4','.webm','.mp3','.wav','.ogg','.m4a','.silk','.dat','.pdf','.txt'):extension='.bin'
+            with self.store.db() as db:
+                current=db.execute('SELECT filename FROM assets WHERE id=?',(identity,)).fetchone()
+                filename=current['filename'] if current else identity+extension
+                if not isinstance(filename,str) or not re.fullmatch(r'[0-9a-f]{64}\.[a-z0-9]{1,6}',filename):raise ValueError('媒体登记路径无效，请检查备份')
+                # Reimport repairs a missing/corrupted managed file; a registry
+                # match alone must not be reported as a successful import.
+                os.replace(temporary,self.root/filename)
+                mime=mimetypes.guess_type(name)[0] or 'application/octet-stream'
+                db.execute('INSERT OR IGNORE INTO assets VALUES(?,?,?,?,?,?)',(identity,name,mime,size,filename,md5.hexdigest()))
+                db.execute('UPDATE assets SET size=?,md5=? WHERE id=?',(size,md5.hexdigest(),identity))
+            return identity
+        finally:
+            if temporary:temporary.unlink(missing_ok=True)
 
     def assets(self,search=''):
         with self.store.db() as db:return [dict(r) for r in db.execute('SELECT id,name,mime,size FROM assets WHERE instr(name,?)>0 ORDER BY rowid DESC LIMIT 500',(search,))]
@@ -103,4 +119,8 @@ class Library:
     def asset(self,identity):
         with self.store.db() as db:row=db.execute('SELECT * FROM assets WHERE id=?',(identity,)).fetchone()
         if not row:raise ValueError('媒体不存在')
-        return dict(row),self.root/row['filename']
+        filename=row['filename']
+        if not isinstance(filename,str) or not re.fullmatch(r'[0-9a-f]{64}\.[a-z0-9]{1,6}',filename):raise ValueError('媒体登记路径无效，请检查备份')
+        path=self.root/filename
+        if not path.is_file():raise ValueError('媒体文件缺失，请从原文件重新导入后重试')
+        return dict(row),path

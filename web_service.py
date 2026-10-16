@@ -26,7 +26,7 @@ import localdb
 import workspace_backup
 from toolbox import select_messages,describe,transcript,analyze
 
-VERSION='2.0.0-preview.3'
+VERSION='2.0.0-preview.4'
 
 
 class State:
@@ -61,10 +61,20 @@ class State:
         return {'download':'/api/download/'+identity,'name':name or Path(path).name}
 
     def local_import(self,params,progress):
+        if not str(params.get('path','')).strip():raise ValueError('请先选择数据库目录或文件')
         root=Path(params['path']).expanduser().resolve()
+        if not root.exists():raise ValueError('所选数据库路径不存在，请重新选择账号的db_storage目录')
+        try:version=int(params.get('version',4))
+        except (TypeError,ValueError):raise ValueError('请选择微信3或微信4加密格式') from None
+        if version not in (3,4):raise ValueError('请选择微信3或微信4加密格式')
         files=localdb.inventory(root);selected=[r for r in files if root.is_file() or r['name'].lower() in ('contact.db','micromsg.db') or __import__('re').match(r'(?i)(?:biz_)?message_\d+\.db|msg\d*\.db',r['name'])]
         if not selected:selected=files
         key_text=params.get('key','').strip();self_name=params.get('self_name','').strip();prepared=[];errors=[];count=0
+        material=None
+        if key_text:
+            try:material=bytes.fromhex(key_text)
+            except ValueError:raise ValueError('数据库密钥应为64位十六进制字符') from None
+            if len(material)!=32:raise ValueError('数据库密钥应为64位十六进制字符')
         if not self_name:
             import re
             account=root.parent.name if root.name=='db_storage' else root.name
@@ -72,20 +82,37 @@ class State:
             if match:self_name=match[1]
         with tempfile.TemporaryDirectory(prefix='studio-source-') as temporary:
             folder=Path(temporary)
-            if params.get('auto_key'):
-                import vision
-                from wechat_keys import find_keys,related_processes
-                pid=int(params.get('pid',0))
+            encrypted=[entry for entry in selected if entry['encrypted']]
+            if params.get('auto_key') and encrypted and not material:
+                from wechat_keys import find_keys,related_processes,ProcessAccessError,ScanLimitError
+                raw_pid=params.get('pid')
+                try:pid=int(raw_pid) if raw_pid not in (None,'') else 0
+                except (ValueError,TypeError):raise ValueError('请选择当前正在运行且可读取的微信进程') from None
                 if pid not in related_processes(0):raise ValueError('请选择当前正在运行的微信进程')
                 pages=[]
-                for entry in selected:
-                    if entry['encrypted']:
-                        with open(entry['path'],'rb') as stream:pages.append(stream.read(4096))
+                for entry in encrypted:
+                    with open(entry['path'],'rb') as stream:page=stream.read(4096)
+                    if len(page)!=4096:raise ValueError(entry['name']+'：加密数据库首页不完整，未检查微信进程')
+                    pages.append(page)
+                checked=0;scan_errors=[]
                 for process in related_processes(pid):
                     pending=[page for page in pages if page[:16].hex() not in self.keys]
                     if not pending or self.cancel.is_set():break
                     progress(f'检查微信关联进程 {process}…')
-                    self.keys.update(find_keys(process,pending,progress,self.cancel.is_set,version=int(params.get('version',4))))
+                    try:
+                        self.keys.update(find_keys(process,pending,progress,self.cancel.is_set,version=version));checked+=1
+                    except (ProcessAccessError,ScanLimitError) as exc:
+                        if self.cancel.is_set():raise ValueError('读取已停止') from None
+                        scan_errors.append(f'PID {process}：{exc}')
+                unresolved=[page for page in pages if page[:16].hex() not in self.keys]
+                if unresolved:
+                    if not checked:
+                        message='没有可完成检查的微信进程，未读取到密钥。'+('\n'+'\n'.join(scan_errors[:8]) if scan_errors else '')
+                    else:message=f'已完成 {checked} 个微信进程检查，仍有 {len(unresolved)} 个数据库未匹配到密钥；当前微信版本的自动解密尚不可用。'
+                    if len(encrypted)==len(selected):raise ValueError(message+'\n可改用已有密钥、已解密消息库或导出文件。')
+                    errors.append(message)
+            elif encrypted and not material and not self.keys and all(entry['encrypted'] for entry in selected):
+                raise ValueError('所选数据库已加密。请提供已有数据库密钥，或使用已解密消息库/导出文件。自动取密钥仍在实验阶段。')
             for index,entry in enumerate(selected):
                 if self.cancel.is_set():raise ValueError('读取已停止')
                 progress(f"准备数据库 {index+1}/{len(selected)}：{entry['name']}")
@@ -94,14 +121,13 @@ class State:
                     if entry['encrypted']:
                         with open(entry['path'],'rb') as stream:first=stream.read(4096)
                         key=self.keys.get(first[:16].hex())
-                        if key_text:
-                            candidate=bytes.fromhex(key_text)
-                            version=int(params.get('version',4))
-                            if not localdb.verify_key(first,candidate,version):candidate=hashlib.pbkdf2_hmac('sha512' if version==4 else 'sha1',candidate,first[:16],256000 if version==4 else 64000,32)
+                        if material:
+                            candidate=material
+                            if not localdb.verify_key(first,candidate,version):candidate=localdb.derive_key(candidate,first[:16],version)
                             key=candidate
                         if not key:raise ValueError('未取得可验证密钥，请使用本机读取密钥或已有数据库密钥')
                         copied=folder/('source-'+str(index));copied.mkdir();snapshot=localdb.stable_copy(entry['path'],copied,cancelled=self.cancel.is_set)
-                        localdb.decrypt_snapshot(snapshot,target,key,int(params.get('version',4)),str(snapshot)+'-wal',cancelled=self.cancel.is_set)
+                        localdb.decrypt_snapshot(snapshot,target,key,version,str(snapshot)+'-wal',cancelled=self.cancel.is_set)
                     else:
                         with closing(localdb.readonly(entry['path'])) as source,closing(sqlite3.connect(target)) as destination:source.backup(destination)
                     prepared.append((entry['path'],target))
@@ -117,8 +143,8 @@ class State:
                 if batch:count+=self.library.import_rows(batch,origin,self_names=[self_name] if self_name else [])
                 coverage.append({'database':Path(origin).name,'messages':read_count,'tables':len(localdb.inspect_schema(path))})
         if not prepared:raise ValueError('未能打开任何数据库。\n'+'\n'.join(errors[:12]))
-        if not any(c['messages'] for c in coverage):raise ValueError('已打开数据库，但没有识别到消息表；请检查所选路径。'+('\n'+'\n'.join(errors[:5]) if errors else ''))
-        source={'path':str(root),'self_name':self_name,'version':int(params.get('version',4))}
+        if not any(c['messages'] for c in coverage):raise ValueError('所选库没有可导入的聊天消息，可能是配置库、联系人库或空库。请选择包含message_*.db / MSG消息表的db_storage目录或聊天导出文件。'+('\n'+'\n'.join(errors[:5]) if errors else ''))
+        source={'path':str(root),'self_name':self_name,'version':version}
         if source not in self.sources:self.sources.append(source)
         self.store.set('local_sources',self.sources)
         return {'inserted':count,'coverage':coverage,'warnings':errors,'note':'更新时重新读取只读快照，已存在消息自动去重；密钥仅本次运行保留。'}
@@ -214,27 +240,31 @@ class State:
                 return {'imported':count,'warnings':errors[:30]}
             return self.job('导入本机媒体文件夹',work)
         if path=='/api/backup':
-            folder=self.root/'data'/'exports';folder.mkdir(exist_ok=True);destination=folder/('Studio备份-'+time.strftime('%Y%m%d-%H%M%S')+'.zip');cfg=self.cfg()
+            folder=self.root/'data'/'exports';folder.mkdir(exist_ok=True);destination=folder/('Studio备份-'+time.strftime('%Y%m%d-%H%M%S')+'-'+secrets.token_hex(4)+'.zip');cfg=self.cfg()
             def work(progress):workspace_backup.create(self.store,cfg,destination);return self.download(destination)
             return self.job('完整备份（含媒体）',work)
         if path=='/api/export':
             from records import export_file,all_rows
             folder=self.root/'data'/'exports';folder.mkdir(exist_ok=True);extension=p.get('format','json')
             if extension not in ('json','csv','html'):raise ValueError('不支持的导出格式')
-            destination=folder/('聊天导出-'+time.strftime('%Y%m%d-%H%M%S')+'.'+extension)
+            destination=folder/('聊天导出-'+time.strftime('%Y%m%d-%H%M%S')+'-'+secrets.token_hex(4)+'.'+extension)
             def work(progress):
                 rows,_=self.library.rows(p.get('contact',''),'',0,10000000)
                 if extension=='json':destination.write_text(json.dumps({'messages':[dict(contact=r['contact'],sender=r['sender'],role=r['role'],time=r['ts'],content=r['content'],type=r['kind']) for r in rows]},ensure_ascii=False,indent=2),'utf-8')
                 else:export_file(destination,rows)
-                return dict(self.download(destination),messages=len(rows),note='JSON保留消息类型；媒体文件请使用完整备份。')
+                result=dict(self.download(destination),messages=len(rows),note='单个聊天导出文件回导上限150MB；媒体和整库迁移请使用完整备份。')
+                if destination.stat().st_size>150*1024**2:result['warnings']=['导出文件超过150MB，当前不能直接回导。请使用完整备份迁移，或按联系人分别导出。']
+                return result
             return self.job('导出会话',work)
         if path=='/api/cancel':self.cancel.set();return {'requested':True}
         if path=='/api/windows':
             import vision
             return [{'hwnd':h,'pid':pid,'title':title} for h,pid,title,kind in vision.list_windows()]
         if path=='/api/processes':
-            from wechat_keys import related_processes
-            return [{'pid':pid,'title':'本机微信进程'} for pid in related_processes(0)]
+            from wechat_keys import related_processes,process_status
+            import vision
+            titles={pid:title for hwnd,pid,title,kind in vision.list_windows()}
+            return [dict(process_status(pid),title=titles.get(pid,'微信后台进程')) for pid in related_processes(0)]
         if path=='/api/window-select':self.engine.select(p['hwnd']);return self.engine.state()
         if path=='/api/window-point':self.engine.point(p['x'],p['y']);return self.engine.state()
         if path=='/api/ocr-test':
@@ -327,9 +357,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length=int(self.headers.get('Content-Length',0))
             upload_params=parse_qs(urlsplit(self.path).query)
-            restoring=path=='/api/upload' and upload_params.get('mode',[''])[0]=='restore'
-            maximum=9*1024**3 if restoring else 512*1024**2
-            if not 0<=length<=maximum:raise ValueError('完整备份包超过9GB上传上限' if restoring else '上传文件大小超过512MB')
+            mode=upload_params.get('mode',['records'])[0]
+            restoring=path=='/api/upload' and mode=='restore'
+            maximum=9*1024**3 if restoring else (512 if mode=='media' else 150)*1024**2
+            if not 0<=length<=maximum:raise ValueError('完整备份包超过9GB上传上限' if restoring else '媒体文件超过512MB' if mode=='media' else '聊天记录文件超过150MB，请按联系人或时间分批导入')
             if path=='/api/upload':
                 if any(j['state']=='running' for j in state.jobs.values()):raise ValueError('请等待当前任务结束后上传文件')
                 p=upload_params;name=Path(p.get('name',['upload.json'])[0]).name
