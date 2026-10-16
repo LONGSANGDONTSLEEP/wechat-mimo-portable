@@ -1,4 +1,7 @@
 """Portable local web application launcher."""
+import multiprocessing
+# PyInstaller worker dispatch must happen before importing the application or UI.
+if __name__=='__main__':multiprocessing.freeze_support()
 import json
 import os
 from pathlib import Path
@@ -109,6 +112,7 @@ def main():
         if state:
             # Request handlers are stopped; finish mutations that were already accepted.
             while active_jobs(state) or state.engine.send_lock.locked():time.sleep(.05)
+            state.clear_database_keys()
         if window:
             try:window.destroy()
             except Exception:pass
@@ -116,7 +120,10 @@ def main():
 
 
 if __name__=='__main__':
-    if '--self-test' in sys.argv:
+    if '--capture-self-test' in sys.argv:
+        from capture_acceptance import run
+        raise SystemExit(0 if run(ROOT)['ok'] else 1)
+    elif '--self-test' in sys.argv:
         from web_selftest import run
         run(ROOT,ASSETS)
     elif '--serve-test' in sys.argv:

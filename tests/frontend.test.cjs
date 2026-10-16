@@ -379,6 +379,155 @@ test('database job failures remain visible inside the source form with the actua
   assert.equal(ui.document.getElementById('sourceStatus').hidden, false);
 });
 
+const capturePreflightResult = () => ({ supported: true, process: { pid: 11, title: '微信 - fixture', version: '4.1.15.fixture' }, entry_count: 1, databases: { encrypted: 2, total: 3 }, note: '人工测试数据，不代表真实微信采集已通过。' });
+async function captureSelection(ui, handler) {
+  await sourcesView(ui);
+  ui.context.fetch = handler || (async url => response(url === '/api/processes' ? [{ pid: 11, title: '微信 - fixture', accessible: true }] : capturePreflightResult()));
+  await ui.document.querySelector('[data-action="refreshCapturePid"]').onclick();
+  ui.document.getElementById('capturePid').value = '11';
+  ui.document.getElementById('dbVersion').value = '4';
+  ui.document.getElementById('selfId').value = 'wxid_fixture';
+}
+
+test('login capture is independent from the legacy scanner and starts disabled until preflight', async () => {
+  const ui = boot(), mount = await sourcesView(ui), calls = [];
+  ui.context.fetch = async url => { calls.push(url); return response({}); };
+  assert.match(mount.innerHTML, /登录阶段取钥/);
+  assert.match(mount.innerHTML, /先检查环境并开始采集，再在官方微信中手动登录/);
+  assert.match(mount.innerHTML, /不会自动退出或重启微信/);
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, true);
+  ui.document.getElementById('dbKey').value = 'synthetic-secret';
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  assert.deepEqual(calls, []);
+  assert.match(ui.document.getElementById('captureStatus').textContent, /刷新并选择/);
+  assert.equal(ui.document.getElementById('dbKey').value, '');
+});
+
+test('successful capture preflight checks only environment and never claims readiness or a key', async () => {
+  const ui = boot(), calls = [];
+  await captureSelection(ui, async (url, options) => { calls.push([url, options]); return response(url === '/api/processes' ? [{ pid: 11, accessible: true }] : capturePreflightResult()); });
+  ui.document.getElementById('dbKey').value = 'a'.repeat(64);
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  assert.deepEqual(calls.map(([url]) => url), ['/api/processes', '/api/capture-preflight']);
+  assert.deepEqual(JSON.parse(calls[1][1].body), { path: 'F:/synthetic/account/db_storage', pid: 11, version: 4 });
+  const status = ui.document.getElementById('captureStatus');
+  assert.match(status.textContent, /环境检查通过，尚未开始采集/);
+  assert.match(status.textContent, /4\.1\.15\.fixture/);
+  assert.doesNotMatch(status.textContent, /采集已就绪|密钥已取得|解密成功/);
+  assert.equal(ui.run('resultStates.captureStatus'), 'checked');
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, false);
+  assert.equal(ui.document.getElementById('dbKey').value, '');
+  assert.equal(ui.document.getElementById('autoKey').checked, undefined);
+});
+
+test('capture preflight errors remain in the form and cannot enable capture', async () => {
+  const ui = boot(); await captureSelection(ui);
+  ui.context.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: '当前版本未找到可用的采集入口 <unsupported>' }) });
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  assert.equal(ui.run('resultStates.captureStatus'), 'error');
+  assert.match(ui.document.getElementById('captureStatus').textContent, /当前版本未找到可用的采集入口 <unsupported>/);
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, true);
+  await sourcesView(ui);
+  assert.match(ui.document.getElementById('captureStatus').textContent, /未找到可用的采集入口/);
+});
+
+test('capture refuses unsupported versions, inaccessible processes, and mismatched preflight identities', async () => {
+  const ui = boot(); await captureSelection(ui);
+  ui.document.getElementById('dbVersion').value = '3';
+  let calls = 0; ui.context.fetch = async () => { calls++; return response(capturePreflightResult()); };
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  assert.equal(calls, 0); assert.match(ui.document.getElementById('captureStatus').textContent, /只支持微信 4/);
+  ui.document.getElementById('dbVersion').value = '4'; ui.document.getElementById('capturePid').value = '22';
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick(); assert.equal(calls, 0);
+  ui.document.getElementById('capturePid').value = '11';
+  ui.context.fetch = async () => response({ ...capturePreflightResult(), process: { pid: 22 } });
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  assert.match(ui.document.getElementById('captureStatus').textContent, /所选进程不一致/);
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, true);
+});
+
+test('a pending capture preflight locks source identity and prevents concurrent jobs or duplicate checks', async () => {
+  const ui = boot(), waiting = deferred(); await captureSelection(ui);
+  let calls = 0; ui.context.fetch = async () => { calls++; return waiting.promise; };
+  const check = ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  for (const id of ['dbPath', 'capturePid', 'selfId', 'dbVersion', 'dbKey', 'autoKey']) assert.equal(ui.document.getElementById(id).disabled, true, id);
+  assert.equal(ui.document.querySelector('[data-action="localImport"]').disabled, true);
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  await assert.rejects(ui.run("job('/api/backup',{})"), /当前任务尚未结束/);
+  assert.equal(calls, 1);
+  waiting.resolve(response(capturePreflightResult())); await check;
+  assert.equal(ui.document.getElementById('dbPath').disabled, false);
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, false);
+});
+
+test('changing the account invalidates preflight even if a stale start button is invoked', async () => {
+  const ui = boot(); await captureSelection(ui);
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  ui.document.getElementById('dbPath').value = 'F:/synthetic/another-account/db_storage';
+  ui.document.getElementById('dbPath').dispatch('input');
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, true);
+  assert.match(ui.document.getElementById('captureStatus').textContent, /已改变，请重新检查/);
+  let calls = 0; ui.context.fetch = async () => { calls++; return response({ job: 'must-not-start' }); };
+  const start = ui.document.querySelector('[data-action="captureStart"]'); start.disabled = false; await start.onclick();
+  assert.equal(calls, 0); assert.match(ui.document.getElementById('captureStatus').textContent, /先检查当前账号/);
+});
+
+test('leaving and reopening sources expires preflight instead of displaying an actionable stale check', async () => {
+  const ui = boot(); await captureSelection(ui);
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  await sourcesView(ui);
+  assert.match(ui.document.getElementById('captureStatus').textContent, /上次环境检查已过期/);
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, true);
+});
+
+test('capture starts the real capture job without sending a key or falling back to the scanner', async () => {
+  const ui = boot(), calls = []; await captureSelection(ui);
+  await ui.document.querySelector('[data-action="capturePreflight"]').onclick();
+  ui.run('poll=async()=>{}');
+  ui.document.getElementById('dbKey').value = 'b'.repeat(64);
+  ui.context.fetch = async (url, options) => { calls.push([url, options]); return response({ job: 'login-capture' }); };
+  await ui.document.querySelector('[data-action="captureStart"]').onclick();
+  assert.deepEqual(calls.map(([url]) => url), ['/api/capture-import']);
+  assert.deepEqual(JSON.parse(calls[0][1].body), { path: 'F:/synthetic/account/db_storage', pid: 11, version: 4, self_name: 'wxid_fixture', timeout: 180 });
+  assert.equal(ui.document.getElementById('dbKey').value, '');
+  assert.doesNotMatch(ui.document.getElementById('captureStatus').textContent, /采集已就绪|认证与导入/);
+  for (const id of ['dbPath', 'capturePid', 'selfId', 'dbVersion']) assert.equal(ui.document.getElementById(id).disabled, true, id);
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, true);
+});
+
+test('capture readiness comes only from backend progress and the existing task bar cancels capture', async () => {
+  const ui = boot(); await sourcesView(ui); ui.run('sessionReady=true');
+  ui.state.jobs = [{ id: 'capture-ready', label: '登录采集并导入', state: 'running', progress: '采集已就绪，请在官方微信中手动登录（或保持登录并打开聊天）' }];
+  const calls = []; ui.context.fetch = async (url, options) => { calls.push([url, options]); return response(url === '/api/state' ? ui.state : { requested: true }); };
+  await ui.run('poll()');
+  assert.equal(ui.document.getElementById('captureStatus').textContent, ui.state.jobs[0].progress);
+  assert.equal(ui.document.getElementById('dbPath').disabled, true);
+  await ui.document.getElementById('cancelJob').onclick();
+  assert.equal(calls.filter(([url]) => url === '/api/cancel').length, 1);
+  assert.deepEqual(JSON.parse(calls.find(([url]) => url === '/api/cancel')[1].body), { job: 'capture-ready' });
+  assert.equal(ui.document.getElementById('cancelJob').disabled, true);
+});
+
+test('capture failure survives navigation and finished jobs restore editable source controls', async () => {
+  const ui = boot(); await sourcesView(ui); ui.run('sessionReady=true');
+  ui.state.jobs = [{ id: 'capture-failed', label: '登录采集并导入', state: 'error', error: '采集超时，所选账号数据库未匹配到有效材料' }];
+  ui.context.fetch = async () => response(ui.state); await ui.run('poll()');
+  assert.equal(ui.run('resultStates.captureStatus'), 'error');
+  assert.doesNotMatch(ui.document.getElementById('captureStatus').textContent, /认证与导入/);
+  assert.equal(ui.document.getElementById('dbPath').disabled, false);
+  await sourcesView(ui);
+  assert.match(ui.document.getElementById('captureStatus').textContent, /采集超时/);
+  assert.equal(ui.document.querySelector('[data-action="captureStart"]').disabled, true);
+});
+
+test('an active capture remains bound and displays progress when the source page is reopened', async () => {
+  const ui = boot(); ui.state.jobs = [{ id: 'active-after-reload', label: '登录采集并导入', state: 'running', progress: '正在验证所选数据库，已匹配 1/2' }];
+  await sourcesView(ui);
+  assert.match(ui.document.getElementById('captureStatus').textContent, /正在验证所选数据库/);
+  for (const id of ['dbPath', 'capturePid', 'selfId', 'dbVersion']) assert.equal(ui.document.getElementById(id).disabled, true, id);
+  assert.equal(ui.document.querySelector('[data-action="capturePreflight"]').disabled, true);
+});
+
 async function showView(ui, name) {
   const mount = ui.document.createElement('div'); ui.document.getElementById('main').replaceChildren(mount);
   ui.context.mount = mount; await ui.run('views.' + name + '(mount)'); return mount;

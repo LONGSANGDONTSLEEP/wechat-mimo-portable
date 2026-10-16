@@ -26,14 +26,14 @@ import localdb
 import workspace_backup
 from toolbox import select_messages,describe,transcript,analyze
 
-VERSION='2.0.0-preview.4'
+VERSION='2.0.0-preview.5'
 
 
 class State:
     def __init__(self,root,assets):
         self.root=Path(root);self.assets=Path(assets);self.store=ChatStore(self.root/'data'/'persona.sqlite3');self.library=Library(self.store)
         self.engine=DesktopEngine(self.store);self.config,self.config_warnings=load_config(self.root/'config.json',DEFAULT)
-        self.key='';self.token=secrets.token_urlsafe(32);self.jobs={};self.job_lock=threading.Lock();self.keys={};self.sources=self.store.get('local_sources',[])
+        self.key='';self.token=secrets.token_urlsafe(32);self.jobs={};self.job_lock=threading.Lock();self.keys={};self.key_scope=None;self.capture_prepared=None;self.sources=self.store.get('local_sources',[])
         self.dialogs=queue.Queue();self.last_seen=time.monotonic();self.exit=threading.Event();self.cancel=threading.Event()
         self.downloads={};self.imports={}
 
@@ -48,17 +48,81 @@ class State:
             identity=secrets.token_hex(8);entry={'id':identity,'label':label,'state':'running','progress':'正在准备…','result':None,'error':''};self.jobs[identity]=entry;self.cancel.clear()
         def progress(text):entry['progress']=str(text)
         def run():
+            result=None;error='';partial=False
             try:
-                entry['result']=work(progress)
-                partial=self.cancel.is_set() or isinstance(entry['result'],dict) and bool(entry['result'].get('warnings'))
-                entry['state']='partial' if partial else 'success';entry['progress']='部分完成，请查看结果中的未完成项' if partial else '已完成'
-            except Exception as exc:entry['error']=str(exc);entry['state']='error';entry['progress']='操作未完成'
+                result=work(progress)
+                partial=self.cancel.is_set() or isinstance(result,dict) and bool(result.get('warnings'))
+            except Exception as exc:
+                error=str(exc)
+            finally:
+                # Release the job slot only after helper/key cleanup completes.
+                if self.cancel.is_set() or error and label=='登录采集并导入':self.clear_database_keys()
+                entry.update(result=result,error=error,progress='操作未完成' if error else '部分完成，请查看结果中的未完成项' if partial else '已完成')
+                entry['state']='error' if error else 'partial' if partial else 'success'
         threading.Thread(target=run,daemon=True).start()
         return {'job':identity}
 
     def download(self,path,name=None):
         identity=secrets.token_hex(12);self.downloads[identity]=(Path(path),name or Path(path).name)
         return {'download':'/api/download/'+identity,'name':name or Path(path).name}
+
+    def clear_database_keys(self):
+        self.keys.clear();self.key_scope=None;self.capture_prepared=None
+
+    def database_scope(self,root,version):
+        scope=(os.path.normcase(str(Path(root).resolve())),int(version))
+        if self.key_scope!=scope:self.clear_database_keys();self.key_scope=scope
+        return scope
+
+    def capture_params(self,params):
+        if not str(params.get('path','')).strip():raise ValueError('请先选择具体账号的数据库目录')
+        root=Path(params['path']).expanduser().resolve()
+        if not root.exists():raise ValueError('所选数据库路径不存在，请重新选择账号的db_storage目录')
+        try:pid=int(params.get('pid',0));version=int(params.get('version',4))
+        except (ValueError,TypeError):raise ValueError('请选择微信4格式与有效的微信主进程') from None
+        if pid<=0 or version!=4:raise ValueError('登录阶段采集目前需要64位微信4主进程')
+        return root,pid,version
+
+    def prepare_capture(self,params):
+        import login_capture
+        root,pid,version=self.capture_params(params)
+        with self.job_lock:
+            if any(j['state']=='running' for j in self.jobs.values()):raise ValueError('请先等待当前任务结束，再检查采集环境')
+            scope=self.database_scope(root,version);self.capture_prepared=None
+            plan,files=login_capture.preflight(pid,root,version)
+            self.capture_prepared={'scope':scope,'pid':pid,'plan':plan,'expires':time.monotonic()+120}
+        return {'supported':True,'process':{'pid':pid,'title':'所选微信主进程','version':plan.get('file_version') or '版本号未知'},'entry_count':len(plan['entry_rvas']),
+                'databases':{'encrypted':len(files),'total':len(login_capture.selected_databases(root))},
+                'note':'仅通过静态入口与权限预检；尚未安装采集器，也未取得密钥。请在两分钟内开始采集。'}
+
+    def capture_import(self,params):
+        import login_capture
+        root,pid,version=self.capture_params(params);scope=(os.path.normcase(str(root)),version)
+        prepared=self.capture_prepared
+        if not prepared or prepared['scope']!=scope or prepared['pid']!=pid or prepared['expires']<time.monotonic():
+            raise ValueError('采集环境检查已过期或账号/进程已变化，请重新检查后再开始')
+        plan=prepared['plan'];self.capture_prepared=None
+        def work(progress):
+            # A capture is one job from preparation through detach and DB import.
+            self.engine.halt();progress('正在停止微信自动回复，等待当前操作退出；尚未开始采集。')
+            until=time.monotonic()+20
+            while self.engine.busy():
+                if self.cancel.is_set():raise ValueError('登录采集已停止')
+                if time.monotonic()>until:raise ValueError('自动回复尚未完全退出，请等待当前操作结束后重新检查采集环境')
+                time.sleep(.05)
+            login_capture.ensure_same_process(pid,plan['target'])
+            files=[entry for entry in login_capture.selected_databases(root) if entry['encrypted']]
+            self.database_scope(root,version);self.keys.clear()
+            found={}
+            try:
+                found=login_capture.capture_keys(pid,plan,files,progress,self.cancel.is_set,params.get('timeout',180),version)
+                if self.cancel.is_set():raise ValueError('登录采集已停止')
+                self.keys.update(found)
+                result=self.local_import({'path':str(root),'version':version,'self_name':str(params.get('self_name','')).strip(),'auto_key':False},progress)
+                result['capture']={'authenticated':len(found),'databases':len(files)}
+                return result
+            finally:found.clear()
+        return self.job('登录采集并导入',work)
 
     def local_import(self,params,progress):
         if not str(params.get('path','')).strip():raise ValueError('请先选择数据库目录或文件')
@@ -67,6 +131,7 @@ class State:
         try:version=int(params.get('version',4))
         except (TypeError,ValueError):raise ValueError('请选择微信3或微信4加密格式') from None
         if version not in (3,4):raise ValueError('请选择微信3或微信4加密格式')
+        self.database_scope(root,version)
         files=localdb.inventory(root);selected=[r for r in files if root.is_file() or r['name'].lower() in ('contact.db','micromsg.db') or __import__('re').match(r'(?i)(?:biz_)?message_\d+\.db|msg\d*\.db',r['name'])]
         if not selected:selected=files
         key_text=params.get('key','').strip();self_name=params.get('self_name','').strip();prepared=[];errors=[];count=0
@@ -150,7 +215,12 @@ class State:
         return {'inserted':count,'coverage':coverage,'warnings':errors,'note':'更新时重新读取只读快照，已存在消息自动去重；密钥仅本次运行保留。'}
 
     def api(self,path,p):
-        if any(j['state']=='running' and '恢复' in j['label'] for j in self.jobs.values()) and path not in ('/api/state','/api/heartbeat','/api/cancel'):
+        current_jobs=list(self.jobs.values())
+        capture_active=any(j['state']=='running' and j['label']=='登录采集并导入' for j in current_jobs)
+        if capture_active and path not in ('/api/state','/api/heartbeat','/api/cancel','/api/quit','/api/monitor-stop','/api/messages','/api/media','/api/statistics','/api/windows','/api/processes','/api/memories'):
+            raise ValueError('登录采集正在运行，请停止采集并等待清理完成后再操作')
+        if capture_active and path=='/api/memories' and (p.get('add') or p.get('delete')):raise ValueError('请等待登录采集结束后修改记忆')
+        if any(j['state']=='running' and '恢复' in j['label'] for j in current_jobs) and path not in ('/api/state','/api/heartbeat','/api/cancel'):
             raise ValueError('工作区正在恢复，请稍后操作')
         if path=='/api/heartbeat':self.last_seen=time.monotonic();return {'ok':True}
         if path=='/api/state':
@@ -221,6 +291,8 @@ class State:
             return {k:dict(v) if hasattr(v,'most_common') else str(v) if k in ('first','last') and v else v for k,v in result.items()}
         if path=='/api/discover':return localdb.discover()
         if path=='/api/inventory':return localdb.inventory(p['path'])
+        if path=='/api/capture-preflight':return self.prepare_capture(p)
+        if path=='/api/capture-import':return self.capture_import(p)
         if path=='/api/local-import':return self.job('读取本机/已解密数据库',lambda progress:self.local_import(p,progress))
         if path=='/api/dialog':
             event=threading.Event();request={'kind':p.get('kind','folder'),'event':event,'value':None};self.dialogs.put(request)
@@ -256,7 +328,12 @@ class State:
                 if destination.stat().st_size>150*1024**2:result['warnings']=['导出文件超过150MB，当前不能直接回导。请使用完整备份迁移，或按联系人分别导出。']
                 return result
             return self.job('导出会话',work)
-        if path=='/api/cancel':self.cancel.set();return {'requested':True}
+        if path=='/api/cancel':
+            with self.job_lock:
+                running=next((j for j in self.jobs.values() if j['state']=='running'),None)
+                if not running or p.get('job') and p['job']!=running['id']:return {'requested':False}
+                self.cancel.set();self.clear_database_keys()
+            return {'requested':True}
         if path=='/api/windows':
             import vision
             return [{'hwnd':h,'pid':pid,'title':title} for h,pid,title,kind in vision.list_windows()]
@@ -272,10 +349,14 @@ class State:
             def work(progress):
                 view=self.engine.inspect(self.engine.monitor['hwnd']);return {'title':view.title,'incoming':view.message,'messages':[{'side':r.side,'text':r.text} for r in view.messages]}
             return self.job('仅测试OCR',work)
-        if path=='/api/monitor-start':self.engine.start(dict(self.cfg(),auto=bool(p.get('auto')),record_contact=p.get('contact',''),title=p.get('title','')),self.key);return self.engine.state()
+        if path=='/api/monitor-start':
+            with self.job_lock:
+                if any(j['state']=='running' for j in self.jobs.values()):raise ValueError('请先等待当前任务结束，再启动微信监听')
+                self.engine.start(dict(self.cfg(),auto=bool(p.get('auto')),record_contact=p.get('contact',''),title=p.get('title','')),self.key)
+            return self.engine.state()
         if path=='/api/monitor-stop':self.engine.halt();return self.engine.state()
         if path=='/api/send-preview':return self.job('发送当前预览',lambda progress:self.engine.send())
-        if path=='/api/quit':self.engine.halt();self.exit.set();return {'ok':True}
+        if path=='/api/quit':self.engine.halt();self.cancel.set();self.clear_database_keys();self.exit.set();return {'ok':True}
         raise ValueError('未知功能接口')
 
 
@@ -386,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
                     def restore(progress):
                         try:
                             cfg,counts,safety=workspace_backup.restore(state.store,state.cfg(),target,state.root/'config.json')
-                            state.config=dict(DEFAULT,**cfg);state.key='';state.keys.clear();state.library=Library(state.store);state.sources=state.store.get('local_sources',[])
+                            state.config=dict(DEFAULT,**cfg);state.key='';state.clear_database_keys();state.library=Library(state.store);state.sources=state.store.get('local_sources',[])
                             return {'restored':counts,'safety':str(safety)}
                         finally:target.unlink(missing_ok=True)
                     return self.response(200,state.job('校验并恢复完整工作区',restore))
