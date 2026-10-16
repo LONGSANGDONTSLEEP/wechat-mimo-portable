@@ -18,7 +18,7 @@ MEDIA_NAME=re.compile(r'[0-9a-f]{64}\.[a-z0-9]{1,6}')
 def clean_config(config):
     result=backup.clean_config(config)
     if 'max_tokens' in config:
-        value=config['max_tokens']
+        value=result['max_tokens']
         if isinstance(value,bool) or not isinstance(value,int) or not 1<=value<=131072:raise ValueError('备份中的回复长度设置不正确')
         result['max_tokens']=value
     if 'reasoning' in config:

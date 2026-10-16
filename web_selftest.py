@@ -49,7 +49,9 @@ def encrypt_page(plain,number,key,salt):
 
 def run(root,assets):
     with tempfile.TemporaryDirectory(prefix='studio-2-selftest-') as temporary:
+        (Path(temporary)/'config.json').write_text(json.dumps(dict(context_size='8192',max_tokens='768',interval='3')),'utf-8-sig')
         state=State(Path(temporary),assets);seed(state);server=Server(state);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        assert state.config['context_size']==8192 and state.config['max_tokens']==768
         base=f'http://127.0.0.1:{server.server_port}'
         def request(path,data=None,auth=True):
             headers={'X-Studio-Token':state.token} if auth else {}
@@ -90,4 +92,4 @@ def run(root,assets):
             image=Image.new('RGB',(500,100),'white');ImageDraw.Draw(image).text((10,10),'你好 微信 测试',font=ImageFont.truetype('msyh.ttc',32),fill='black')
             assert '你好' in ''.join(asyncio.run(recognize_image(image)).text.split())
         finally:server.shutdown();server.server_close();thread.join()
-    (Path(root)/'self-test.txt').write_text(f'SELF_TEST_OK {VERSION}: authenticated HTTP + import/search + simulated AI success/failure + authenticated SQLCipher snapshot + media backup/restore + bundled OCR','utf-8')
+    (Path(root)/'self-test.txt').write_text(f'SELF_TEST_OK {VERSION}: legacy config migration + authenticated HTTP + import/search + simulated AI success/failure + authenticated SQLCipher snapshot + media backup/restore + bundled OCR','utf-8')

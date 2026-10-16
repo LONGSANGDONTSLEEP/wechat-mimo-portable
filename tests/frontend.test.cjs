@@ -36,6 +36,7 @@ class Element {
     for (const child of children) child.parent = this;
   }
   append(el) { el.parent = this; this.children.push(el); }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter(el => el !== this); this.parent = null; }
   setAttribute(key, value) { this.attrs[key] = value; }
   addEventListener(key, fn) { (this.listeners[key] ||= []).push(fn); }
   dispatch(key) { for (const fn of this.listeners[key] || []) fn({ preventDefault() {}, target: this }); }
@@ -80,7 +81,7 @@ function boot() {
   });
   // Suppress only the automatic boot request. All view and action code is unchanged.
   const source = fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8');
-  const start = source.lastIndexOf('(async()=>{try{await api(');
+  const start = source.lastIndexOf('startPolling();');
   assert.ok(start > 0, 'Find automatic startup');
   vm.runInContext(source.slice(0, start), context);
   const state = { config: { provider: 'lmstudio', model: 'demo', base_url: 'http://127.0.0.1:1234/v1', context_size: 8192, prompt: '', max_tokens: 768 }, jobs: [], contacts: [], engine: { running: false }, stats: { total: 0 } };
@@ -215,4 +216,80 @@ test('media batch stop preserves the current file and skips remaining files', as
   assert.equal(uploads, 1); assert.equal(ui.run('fileBusy'), false);
   assert.equal(ui.document.getElementById('dialogTitle').textContent, '媒体导入部分完成');
   assert.match(ui.document.getElementById('dialogBody').innerHTML, /未处理 1 个/);
+});
+
+test('startup HTTP 400 shows the configuration error as a service failure with a retry action', async () => {
+  const ui = boot(); ui.run('state=null;firstPoll=true');
+  ui.context.fetch = async url => url === '/api/session' ? response({ ok: true }) : { ok: false, status: 400, json: async () => ({ error: '模型配置范围不正确：context_size' }) };
+  await ui.run('poll()');
+  assert.equal(ui.document.getElementById('connectionStatus').textContent, '本机服务异常');
+  assert.match(ui.document.getElementById('main').innerHTML, /模型配置范围不正确：context_size/);
+  assert.ok(ui.document.getElementById('retryStartup'));
+  assert.equal(ui.document.getElementById('modelId'), null, 'Do not invent a settings form before configuration has loaded');
+});
+
+test('a successful poll after startup failure automatically opens the route selected during the failure', async () => {
+  const ui = boot(); ui.run('state=null;firstPoll=true');
+  let fail = true;
+  ui.context.fetch = async url => url === '/api/session' ? response({ ok: true }) : fail ? { ok: false, status: 500, json: async () => ({ error: 'configuration unavailable' }) } : response(ui.state);
+  await ui.run('poll()'); await ui.run("render('settings')");
+  assert.equal(ui.document.getElementById('modelId'), null);
+  fail = false; await ui.run('poll()');
+  assert.equal(ui.document.getElementById('connectionStatus').textContent, '本机已连接');
+  assert.equal(ui.document.getElementById('modelId').value, 'demo');
+  assert.equal(ui.document.getElementById('crumb').textContent, '模型与设置');
+  assert.equal(ui.document.getElementById('retryStartup'), null);
+});
+
+test('the retry button recovers the workspace without requiring a page reload', async () => {
+  const ui = boot(); ui.run('state=null;firstPoll=true'); let fail = true;
+  ui.context.fetch = async url => url === '/api/session' ? response({ ok: true }) : fail ? { ok: false, status: 400, json: async () => ({ error: 'old config' }) } : response(ui.state);
+  await ui.run('poll()'); const retry = ui.document.getElementById('retryStartup');
+  fail = false; await retry.onclick();
+  assert.match(ui.document.getElementById('main').innerHTML, /让记录与交流/);
+  assert.equal(ui.document.getElementById('retryStartup'), null);
+});
+
+test('network failures are classified separately and session setup is retried after recovery', async () => {
+  const ui = boot(), calls = []; ui.run('state=null;firstPoll=true'); let fail = true;
+  ui.context.fetch = async url => { calls.push(url); if (fail) throw Error('connection refused'); return response(url === '/api/session' ? { ok: true } : ui.state); };
+  await ui.run('poll()');
+  assert.equal(ui.document.getElementById('connectionStatus').textContent, '本机连接中断');
+  assert.match(ui.document.getElementById('main').innerHTML, /无法连接本机工作台/);
+  fail = false; await ui.run('poll()');
+  assert.deepEqual(calls, ['/api/session', '/api/session', '/api/state']);
+  assert.equal(ui.document.getElementById('connectionStatus').textContent, '本机已连接');
+});
+
+test('an HTTP response with unreadable JSON is a service error rather than a disconnected network', async () => {
+  const ui = boot(); ui.run('state=null;firstPoll=true;sessionReady=true');
+  ui.context.fetch = async () => ({ ok: false, status: 500, json: async () => { throw Error('invalid JSON'); } });
+  await ui.run('poll()');
+  assert.equal(ui.document.getElementById('connectionStatus').textContent, '本机服务异常');
+  assert.match(ui.document.getElementById('main').innerHTML, /无法读取的响应/);
+});
+
+test('poll errors preserve a loaded form and expose the actual application error', async () => {
+  const ui = boot();
+  ui.document.getElementById('main').innerHTML = '<textarea id="unsavedDraft"></textarea>';
+  ui.document.getElementById('unsavedDraft').value = 'Keep this draft';
+  ui.context.fetch = async url => url === '/api/session' ? response({ ok: true }) : { ok: false, status: 400, json: async () => ({ error: '模型配置范围不正确：context_size' }) };
+  await ui.run('poll()');
+  assert.equal(ui.document.getElementById('unsavedDraft').value, 'Keep this draft');
+  assert.equal(ui.document.getElementById('connectionStatus').textContent, '本机服务异常');
+  assert.match(ui.document.getElementById('connectionStatus').title, /context_size/);
+  assert.match(ui.document.getElementById('toast').textContent, /context_size/);
+});
+
+test('configuration migration warnings are escaped, displayed, and removed after settings save', async () => {
+  const ui = boot(); ui.state.config_warnings = ['context_size 无效，已使用默认值 <8192>'];
+  ui.run('poll=async()=>{}');
+  ui.context.fetch = async () => response({ saved: true, key_set: false });
+  const mount = ui.document.createElement('div'); ui.document.getElementById('main').replaceChildren(mount);
+  ui.context.mount = mount; await ui.run('views.settings(mount)');
+  assert.ok(ui.document.getElementById('configWarnings'));
+  assert.match(mount.innerHTML, /context_size 无效/); assert.match(mount.innerHTML, /&lt;8192&gt;/);
+  for (const [id, value] of Object.entries({ contextSize: '8192', maxTokens: '768', reasoning: 'none' })) ui.document.getElementById(id).value = value;
+  await ui.document.querySelector('[data-action="saveSettings"]').onclick();
+  assert.equal(ui.document.getElementById('configWarnings'), null);
 });
