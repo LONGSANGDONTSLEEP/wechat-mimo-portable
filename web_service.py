@@ -21,20 +21,18 @@ from app import DEFAULT,completion,validate_connection,prepare_messages
 from chatdata import ChatStore,read_rows
 from library import Library
 from desktop_engine import DesktopEngine
+from configuration import load_config
 import localdb
 import workspace_backup
 from toolbox import select_messages,describe,transcript,analyze
 
-VERSION='2.0.0-preview.2'
+VERSION='2.0.0-preview.3'
 
 
 class State:
     def __init__(self,root,assets):
         self.root=Path(root);self.assets=Path(assets);self.store=ChatStore(self.root/'data'/'persona.sqlite3');self.library=Library(self.store)
-        self.engine=DesktopEngine(self.store);self.config=dict(DEFAULT)
-        if (self.root/'config.json').exists():
-            try:self.config.update(json.loads((self.root/'config.json').read_text('utf-8')))
-            except (ValueError,OSError):pass
+        self.engine=DesktopEngine(self.store);self.config,self.config_warnings=load_config(self.root/'config.json',DEFAULT)
         self.key='';self.token=secrets.token_urlsafe(32);self.jobs={};self.job_lock=threading.Lock();self.keys={};self.sources=self.store.get('local_sources',[])
         self.dialogs=queue.Queue();self.last_seen=time.monotonic();self.exit=threading.Event();self.cancel=threading.Event()
         self.downloads={};self.imports={}
@@ -133,7 +131,7 @@ class State:
             self.last_seen=time.monotonic()
             from backup import clean_config
             config=clean_config(self.config);config.pop('auto',None)
-            return {'version':VERSION,'stats':self.store.stats(),'contacts':self.library.contacts(),'config':config,'key_set':bool(self.key),'jobs':list(self.jobs.values())[-12:],
+            return {'version':VERSION,'stats':self.store.stats(),'contacts':self.library.contacts(),'config':config,'config_warnings':list(self.config_warnings),'key_set':bool(self.key),'jobs':list(self.jobs.values())[-12:],
                     'style':self.store.style(),'sources':self.store.get('local_sources',[]),'persona':{k:self.store.get(k,True) for k in ('learn','longer','proactive')},'engine':self.engine.state()}
         if path=='/api/messages':
             rows,total=self.library.rows(p.get('contact',''),p.get('keyword',''),max(0,int(p.get('offset',0))),100)
@@ -150,6 +148,7 @@ class State:
             self.config=dict(DEFAULT,**updated)
             if 'key' in p:self.key=str(p['key']).strip()
             (self.root/'config.json').write_text(json.dumps(self.config,ensure_ascii=False,indent=2),'utf-8')
+            self.config_warnings=[]
             return {'saved':True,'key_set':bool(self.key)}
         if path=='/api/models':
             provider=self.config.get('provider');base=urlsplit(self.config['base_url'])

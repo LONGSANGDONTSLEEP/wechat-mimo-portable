@@ -18,6 +18,10 @@ TABLES = {'messages': {'id','contact','sender','role','ts','content','source','d
 def clean_config(config):
     if not isinstance(config,dict):raise ValueError('备份中的模型配置应为对象')
     result = {k:v for k,v in config.items() if k in CONFIG_KEYS}
+    # Legacy Tk settings were saved from StringVar, including numeric fields.
+    for field in ('context_size','max_tokens','interval'):
+        value=result.get(field)
+        if isinstance(value,str) and value.strip().isascii() and value.strip().isdecimal() and len(value.strip())<=9:result[field]=int(value.strip())
     if any(not isinstance(v,(str,int,float)) or isinstance(v,bool) for v in result.values()):
         raise ValueError('备份中的模型配置格式不正确')
     for field,minimum,maximum in (('context_size',2048,131072),('max_tokens',128,8192)):
